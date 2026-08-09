@@ -85,11 +85,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/proofofwork-agency/opencode-multimodel.git",
+    "url": "git+https://github.com/proofofwork-agency/opencode.git",
     "directory": "packages/opencode-multimodel"
   },
-  "homepage": "https://github.com/proofofwork-agency/opencode-multimodel/tree/main/packages/opencode-multimodel#readme",
+  "homepage": "https://github.com/proofofwork-agency/opencode/tree/main/packages/opencode-multimodel#readme",
   "bugs": {
-    "url": "https://github.com/proofofwork-agency/opencode-multimodel/issues"
+    "url": "https://github.com/proofofwork-agency/opencode/issues"
   }
 }

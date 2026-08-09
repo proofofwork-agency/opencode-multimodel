@@ -48,11 +48,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/proofofwork-agency/opencode-multimodel.git",
+    "url": "git+https://github.com/proofofwork-agency/opencode.git",
     "directory": "packages/codex-delegator"
   },
-  "homepage": "https://github.com/proofofwork-agency/opencode-multimodel/tree/main/packages/codex-delegator#readme",
+  "homepage": "https://github.com/proofofwork-agency/opencode/tree/main/packages/codex-delegator#readme",
   "bugs": {
-    "url": "https://github.com/proofofwork-agency/opencode-multimodel/issues"
+    "url": "https://github.com/proofofwork-agency/opencode/issues"
   }
 }
