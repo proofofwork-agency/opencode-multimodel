@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-codex-delegate",
+  "version": "0.1.0",
+  "description": "Pluggable OpenCode provider and delegation tools backed by the local OpenAI Codex CLI",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./factory": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    },
+    "./provider": {
+      "types": "./dist/provider.d.ts",
+      "import": "./dist/provider.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
+  "scripts": {
+    "clean": "bun -e 'import { rm } from \"node:fs/promises\"; await rm(\"dist\", { recursive: true, force: true })'",
+    "build": "bun run clean && bun build src/index.ts src/plugin.ts src/provider.ts --outdir dist --target bun --format esm --packages external --splitting && tsc -p tsconfig.build.json",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run test && bun run typecheck && bun run build"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "3.0.8",
+    "@opencode-ai/plugin": "^1.18.10",
+    "codex-delegator": "^0.1.0"
+  },
+  "devDependencies": {
+    "@tsconfig/bun": "1.0.9",
+    "@types/bun": "1.3.13",
+    "typescript": "5.8.2"
+  },
+  "keywords": [
+    "opencode",
+    "codex",
+    "openai",
+    "plugin",
+    "delegation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/proofofwork-agency/opencode-multimodel.git",
+    "directory": "packages/opencode-codex-delegate"
+  },
+  "homepage": "https://github.com/proofofwork-agency/opencode-multimodel/tree/main/packages/opencode-codex-delegate#readme",
+  "bugs": {
+    "url": "https://github.com/proofofwork-agency/opencode-multimodel/issues"
+  }
+}

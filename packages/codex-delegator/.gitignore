@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.codex-delegate/
+.codex-delegate-worktrees/
