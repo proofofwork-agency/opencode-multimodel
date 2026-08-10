@@ -73,7 +73,10 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
     } as never,
     { statePath: `${directory}/state.json`, fleet },
   );
-  const config: { command?: Record<string, { template: string }> } = {};
+  const config: {
+    small_model?: string;
+    command?: Record<string, { template: string; model?: string }>;
+  } = { small_model: "test/tool-model" };
   await plugin.config?.(config);
 
   expect(Object.keys(config.command ?? {})).toEqual(
@@ -91,7 +94,12 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
   expect(config.command?.collab?.template).toContain(
     "MUST NOT be empty",
   );
+  expect(config.command?.collab?.model).toBe("test/tool-model");
+  expect(config.command?.workflow?.model).toBe("test/tool-model");
+  expect(config.command?.fleet?.model).toBe("test/tool-model");
   expect(config.command?.mode).toBeUndefined();
+  expect(config.command?.runs).toBeUndefined();
+  expect(config.command?.graph).toBeUndefined();
   expect(Object.keys(plugin.tool ?? {})).toEqual([
     "multimodel_fleet",
     "multimodel_collab",

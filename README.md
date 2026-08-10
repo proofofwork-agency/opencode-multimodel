@@ -24,6 +24,15 @@ All packages are configured to publish on npm under the `alpha` dist-tag. Once r
 }
 ```
 
+## Successor to Poly
+
+`opencode-multimodel` and `opencode-codex-delegate` supersede the standalone
+[Poly OpenCode fork](https://github.com/proofofwork-agency/thinktank/tree/main/concepts/poly).
+Poly is retained only as a historical ThinkTank concept; new OpenCode
+integrations should use these plugins. Both plugins and the supporting
+`codex-delegator` library are still alpha-stage and have not yet been published
+to npm.
+
 OpenCode discovers separate `./server` and `./tui` entrypoints for both plugin
 packages. `opencode-codex-delegate` registers `codex-delegate/<model>` selections;
 `opencode-multimodel` can use those models as ordinary fleet seats without

@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import type { TuiPromptInfo } from "@opencode-ai/plugin/tui";
 import { parseOptions } from "../src/options.ts";
 import {
+  collaborationComposerInput,
   composerSlotIsActive,
   isPlainComposerSubmitKey,
+  nextFleetMemberID,
   routeComposerPrompt,
 } from "../src/tui.tsx";
 import type { WorkflowDefinition } from "../src/types.ts";
@@ -15,6 +17,12 @@ const workflows: WorkflowDefinition[] = [{
 }];
 
 describe("native composer routing", () => {
+  test("prefills interactive collaboration in the native composer", () => {
+    expect(collaborationComposerInput("council")).toBe(
+      "/collab council ",
+    );
+  });
+
   test("keeps SINGLE input and attachment objects unchanged", () => {
     const prompt = value("Review this", [{ type: "file", mime: "text/plain", url: "file:///a" }]);
     expect(routeComposerPrompt(
@@ -109,12 +117,27 @@ describe("native composer routing", () => {
     )).toBe(false);
   });
 
-  test("takes over only an unmodified Enter key for native submission", () => {
+  test("routes only an unhandled plain Enter when no dialog is open", () => {
     expect(isPlainComposerSubmitKey({ name: "return" })).toBe(true);
     expect(isPlainComposerSubmitKey({ name: "enter" })).toBe(true);
+    expect(isPlainComposerSubmitKey({ name: "return" }, true)).toBe(false);
+    expect(isPlainComposerSubmitKey({ name: "return" }, false, true)).toBe(false);
     expect(isPlainComposerSubmitKey({ name: "return", shift: true })).toBe(false);
     expect(isPlainComposerSubmitKey({ name: "enter", ctrl: true })).toBe(false);
     expect(isPlainComposerSubmitKey({ name: "tab" })).toBe(false);
+  });
+
+  test("creates stable collision-free IDs for added fleet seats", () => {
+    expect(nextFleetMemberID("codex-delegate", "gpt-5.6-sol", [])).toBe(
+      "codex-delegate",
+    );
+    expect(nextFleetMemberID("codex-delegate", "gpt-5.6-sol", [
+      "codex-delegate",
+    ])).toBe("codex-delegate-gpt-5-6-sol");
+    expect(nextFleetMemberID("codex-delegate", "gpt-5.6-sol", [
+      "codex-delegate",
+      "codex-delegate-gpt-5-6-sol",
+    ])).toBe("codex-delegate-gpt-5-6-sol-2");
   });
 });
 

@@ -62,18 +62,25 @@ const server: Plugin = async (input, rawOptions) => {
   return {
     async config(config) {
       config.command ??= {};
+      const commandModel = typeof config.small_model === "string" &&
+          config.small_model.trim()
+        ? config.small_model
+        : undefined;
       config.command.lead ??= {
         description: "Select the multi-model fleet lead",
+        model: commandModel,
         template:
           "Call multimodel_fleet with action=set-lead and memberID=$ARGUMENTS. Return the tool result.",
       };
       config.command.fleet ??= {
         description: "Show the multi-model fleet",
+        model: commandModel,
         template:
           "Call multimodel_fleet with action=list. Return the tool result.",
       };
       config.command.collab ??= {
         description: "Run a multi-model collaboration",
+        model: commandModel,
         template: `Act only as a deterministic command adapter. Do not answer the user's request yourself. Call multimodel_collab exactly once and return its tool result verbatim.
 
 The raw command arguments are between the delimiters below:
@@ -89,11 +96,13 @@ Parsing rules:
       };
       config.command.workflow ??= {
         description: "Run a durable multi-model workflow",
+        model: commandModel,
         template:
           "Call multimodel_workflow with action=run. Treat the first argument as name and the remaining text as input: $ARGUMENTS",
       };
       config.command.workflows ??= {
         description: "List multi-model workflows and recent runs",
+        model: commandModel,
         template:
           "Call multimodel_workflow with action=list. Return the tool result.",
       };

@@ -55,11 +55,19 @@ type ProviderList = {
     models: Record<string, {
       id: string;
       name: string;
+      status?: string;
       capabilities?: { output?: { text?: boolean } };
     }>;
   }>;
   connected?: string[];
   default?: Record<string, string>;
+};
+
+export type AvailableFleetModel = {
+  providerID: string;
+  providerName: string;
+  modelID: string;
+  modelName: string;
 };
 
 type ActiveChild = {
@@ -457,6 +465,39 @@ export async function discoverFleet(client: AgentClient): Promise<Fleet> {
       } satisfies FleetMember];
     });
   return { leadID: members[0]?.id ?? "lead", members };
+}
+
+export async function listAvailableFleetModels(
+  client: AgentClient,
+): Promise<AvailableFleetModel[]> {
+  if (!client.provider) return [];
+  const response = await client.provider.list();
+  if (response.error || !response.data) return [];
+  const connected = new Set(
+    response.data.connected ?? response.data.all.map((provider) => provider.id),
+  );
+  const order = new Map(
+    (response.data.connected ?? []).map((providerID, index) => [providerID, index]),
+  );
+  return [...response.data.all]
+    .filter((provider) => connected.has(provider.id))
+    .sort((left, right) =>
+      (order.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
+      (order.get(right.id) ?? Number.MAX_SAFE_INTEGER)
+    )
+    .flatMap((provider) =>
+      Object.entries(provider.models)
+        .filter(([, model]) =>
+          model.status !== "deprecated" &&
+          model.capabilities?.output?.text !== false
+        )
+        .map(([modelID, model]) => ({
+          providerID: provider.id,
+          providerName: provider.name,
+          modelID,
+          modelName: model.name || model.id || modelID,
+        }))
+    );
 }
 
 function sessionKey(input: RunAgentInput) {

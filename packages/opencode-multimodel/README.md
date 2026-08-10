@@ -9,13 +9,20 @@ This package has two surfaces:
 - `opencode-multimodel/core` is a reusable orchestration library with an injected `AgentRunner`.
 - `opencode-multimodel/server` and `opencode-multimodel/tui` are OpenCode plugin entrypoints. OpenCode resolves them automatically from one installed package.
 
-The collaboration behavior is adapted from the tested Poly orchestration engine, but this package has no Poly runtime dependency. It uses only OpenCode's public plugin and SDK APIs.
+The collaboration behavior is adapted from the tested
+[Poly orchestration engine](https://github.com/proofofwork-agency/thinktank/tree/main/concepts/poly),
+which this plugin supersedes. The plugin has no Poly runtime dependency and uses
+only OpenCode's public plugin and SDK APIs.
 
 ## What it adds
 
 - `/lead` selects the model that owns assignments, synthesis, and verdicts.
-- `/fleet` opens a dedicated fleet screen.
-- `/collab` runs `lead`, `pair`, `round`, `council`, `orchestrate`, `handoff`, `panel`, `deliberate`, or `jury` mode.
+- `/fleet` opens an interactive fleet manager: Enter toggles participants, and
+  actions add any connected model, choose the lead, remove seats, or open the
+  detailed fleet screen.
+- `/collab` interactively selects `lead`, `pair`, `round`, `council`,
+  `orchestrate`, `handoff`, `panel`, `deliberate`, or `jury`, then prefills the
+  native session composer so the request and result stay in the normal chat.
 - `/workflow` selects and runs a saved DAG or confined script workflow.
 - `/mode` and the clickable composer badge select `SINGLE`, `TEAM`, or
   `WORKFLOW` without replacing OpenCode's native prompt implementation.
@@ -121,6 +128,12 @@ You can provide an explicit fleet in plugin options:
 The multi-model plugin treats every seat as an ordinary OpenCode `{ providerID, modelID }` selection. A delegate can participate directly when its plugin exposes Codex as a real OpenCode provider, for example `codex-delegate/gpt-5.6-sol`.
 
 Authentication and billing remain the delegate provider's responsibility. If that provider uses the Codex CLI subscription session, child fleet calls use the same subscription path and share its rate limits. This plugin does not convert API-key billing into subscription usage or bypass provider limits.
+
+Slash-command adapters use OpenCode's configured `small_model` when present.
+This lets `/collab`, `/workflow`, and `/fleet` call OpenCode tools even when the
+currently selected primary model is a delegate provider whose native CLI tool
+surface does not include OpenCode plugin tools. The delegate still participates
+normally as a fleet child.
 
 A tool-only delegate cannot be selected as a fleet model. It must expose a provider/model pair first.
 

@@ -19,6 +19,7 @@ import {
 import {
   asOpenCodeClient,
   discoverFleet,
+  listAvailableFleetModels,
   OpenCodeAgentRunner,
 } from "./opencode.ts";
 import { RunService } from "./orchestration.ts";
@@ -133,13 +134,12 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       {
         name: "multimodel.fleet",
         title: "Multi-model fleet",
-        description: "View fleet models and the selected lead",
+        description: "Select participants and add, remove, or lead models",
         category: "Multi-model",
         namespace: "palette",
         slashName: "fleet",
         run() {
-          api.route.navigate(ROUTE_FLEET, { returnRoute: api.route.current });
-          api.ui.dialog.clear();
+          void manageFleet(api, store, client);
         },
       },
       {
@@ -161,7 +161,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         namespace: "palette",
         slashName: "collab",
         run() {
-          void selectCollaboration(api, store, options);
+          void selectCollaboration(api, store, options, composer);
         },
       },
       {
@@ -285,8 +285,7 @@ function FleetScreen(props: ScreenProps) {
               </For>
             </Show>
             <text fg={props.api.theme.current.textMuted}>
-              Use /lead to select the lead. Use multimodel_fleet to add or
-              remove seats.
+              Use /fleet to toggle participants or add and remove model seats.
             </text>
           </box>
         )}
@@ -442,7 +441,7 @@ function WorkflowScreen(props: ScreenProps & { runs: RunService }) {
     if (!definition) throw new Error(`Workflow ${name} does not exist.`);
     if (definition.kind === "script") {
       throw new Error(
-        "Run script workflows through the native /workflow command so OpenCode can request source-hash permission.",
+        "Run script workflows through /workflow so OpenCode can request source-hash permission.",
       );
     }
     return props.runs.startWorkflow({
@@ -703,12 +702,13 @@ function registerComposerInputRouting(
     if (routed !== active.current) active.set(routed);
     return active;
   };
-  api.lifecycle.onDispose(api.keymap.intercept("key", (context) => {
-    if (!isPlainComposerSubmitKey(context.event)) return;
-    const active = route();
-    if (!active) return;
-    context.consume();
-    active.submit();
+  api.lifecycle.onDispose(api.keymap.intercept("key:after", (context) => {
+    if (!isPlainComposerSubmitKey(
+      context.event,
+      api.ui.dialog.open,
+      context.handled,
+    )) return;
+    route();
   }, { priority: 10_000 }));
   api.lifecycle.onDispose(api.keymap.registerLayer({
     priority: 10_000,
@@ -732,8 +732,9 @@ export function isPlainComposerSubmitKey(event: {
   meta?: boolean;
   shift?: boolean;
   option?: boolean;
-}) {
-  return (event.name === "return" || event.name === "enter") &&
+}, dialogOpen = false, keymapHandled = false) {
+  return !dialogOpen && !keymapHandled &&
+    (event.name === "return" || event.name === "enter") &&
     !event.ctrl && !event.meta && !event.shift && !event.option;
 }
 
@@ -1215,15 +1216,237 @@ async function selectLead(api: TuiPluginApi, store: StateStore) {
   ));
 }
 
+type FleetClient = ReturnType<typeof asOpenCodeClient>;
+
+async function manageFleet(
+  api: TuiPluginApi,
+  store: StateStore,
+  client: FleetClient,
+) {
+  const state = await store.read();
+  const DialogSelect = api.ui.DialogSelect;
+  const enabled = state.fleet.members.filter((member) => member.enabled).length;
+  api.ui.dialog.replace(() => (
+    <DialogSelect
+      title={`Multi-model fleet · ${enabled} active · lead ${state.fleet.leadID}`}
+      skipFilter
+      options={[
+        ...state.fleet.members.map((member) => ({
+          title: `${member.enabled ? "☑" : "☐"} ${member.id === state.fleet.leadID ? "★ " : ""}${member.id}`,
+          value: `toggle:${member.id}`,
+          description: `${member.role} · ${member.model.providerID}/${member.model.modelID} · ${member.enabled ? "on" : "off"}`,
+          onSelect() {
+            if (member.id === state.fleet.leadID && member.enabled) {
+              toast(api, "Choose another lead before disabling this seat.", "warning");
+              return;
+            }
+            void store.enableMember(member.id, !member.enabled)
+              .then(() => manageFleet(api, store, client))
+              .then(() =>
+                toast(
+                  api,
+                  `${member.id} ${member.enabled ? "disabled" : "enabled"}.`,
+                  "success",
+                )
+              )
+              .catch((error) => toast(api, String(error), "error"));
+          },
+        })),
+        {
+          title: "＋ add a specific model",
+          value: "add",
+          description: "Choose any connected text model, including Codex delegate models",
+          onSelect() {
+            void selectFleetModel(api, store, client)
+              .catch((error) => toast(api, String(error), "error"));
+          },
+        },
+        {
+          title: "★ choose fleet lead",
+          value: "lead",
+          description: "The lead owns synthesis and final decisions",
+          onSelect() {
+            void selectFleetLead(api, store, client)
+              .catch((error) => toast(api, String(error), "error"));
+          },
+        },
+        {
+          title: "− remove a model seat",
+          value: "remove",
+          description: "Remove a non-lead seat from the durable fleet",
+          disabled: state.fleet.members.every((member) =>
+            member.id === state.fleet.leadID
+          ),
+          onSelect() {
+            void selectFleetRemoval(api, store, client)
+              .catch((error) => toast(api, String(error), "error"));
+          },
+        },
+        {
+          title: "◎ open fleet overview",
+          value: "overview",
+          description: "Show the full fleet route and model details",
+          onSelect() {
+            api.route.navigate(ROUTE_FLEET, { returnRoute: api.route.current });
+            api.ui.dialog.clear();
+          },
+        },
+      ]}
+    />
+  ));
+}
+
+async function selectFleetModel(
+  api: TuiPluginApi,
+  store: StateStore,
+  client: FleetClient,
+) {
+  const models = await listAvailableFleetModels(client);
+  if (models.length === 0) {
+    toast(api, "No connected text models are available.", "warning");
+    return manageFleet(api, store, client);
+  }
+  const DialogSelect = api.ui.DialogSelect;
+  api.ui.dialog.replace(
+    () => (
+      <DialogSelect
+        title="Add model seat"
+        placeholder="Filter provider or model"
+        options={models.map((model) => ({
+          title: model.modelName,
+          value: `${model.providerID}/${model.modelID}`,
+          category: model.providerName,
+          description: `${model.providerID}/${model.modelID}`,
+          onSelect() {
+            void addFleetModel(api, store, client, model)
+              .catch((error) => toast(api, String(error), "error"));
+          },
+        }))}
+      />
+    ),
+    () => void manageFleet(api, store, client),
+  );
+}
+
+async function addFleetModel(
+  api: TuiPluginApi,
+  store: StateStore,
+  client: FleetClient,
+  model: { providerID: string; modelID: string },
+) {
+  const state = await store.read();
+  const id = nextFleetMemberID(
+    model.providerID,
+    model.modelID,
+    state.fleet.members.map((member) => member.id),
+  );
+  await store.upsertMember({
+    id,
+    role: "specialist",
+    model: { providerID: model.providerID, modelID: model.modelID },
+    agent: "plan",
+    enabled: true,
+    isolation: "shared",
+  });
+  await manageFleet(api, store, client);
+  toast(api, `${id} added to the fleet.`, "success");
+}
+
+async function selectFleetLead(
+  api: TuiPluginApi,
+  store: StateStore,
+  client: FleetClient,
+) {
+  const state = await store.read();
+  const DialogSelect = api.ui.DialogSelect;
+  api.ui.dialog.replace(
+    () => (
+      <DialogSelect
+        title="Select fleet lead"
+        current={state.fleet.leadID}
+        options={state.fleet.members
+          .filter((member) => member.enabled)
+          .map((member) => ({
+            title: member.id,
+            value: member.id,
+            description: `${member.role} · ${member.model.providerID}/${member.model.modelID}`,
+            onSelect() {
+              void store.setLead(member.id)
+                .then(() => manageFleet(api, store, client))
+                .then(() => toast(api, `${member.id} is now LEAD.`, "success"))
+                .catch((error) => toast(api, String(error), "error"));
+            },
+          }))}
+      />
+    ),
+    () => void manageFleet(api, store, client),
+  );
+}
+
+async function selectFleetRemoval(
+  api: TuiPluginApi,
+  store: StateStore,
+  client: FleetClient,
+) {
+  const state = await store.read();
+  const removable = state.fleet.members.filter((member) =>
+    member.id !== state.fleet.leadID
+  );
+  if (removable.length === 0) return manageFleet(api, store, client);
+  const DialogSelect = api.ui.DialogSelect;
+  api.ui.dialog.replace(
+    () => (
+      <DialogSelect
+        title="Remove model seat"
+        options={removable.map((member) => ({
+          title: member.id,
+          value: member.id,
+          description: `${member.model.providerID}/${member.model.modelID}`,
+          onSelect() {
+            void store.removeMember(member.id)
+              .then(() => manageFleet(api, store, client))
+              .then(() => toast(api, `${member.id} removed.`, "success"))
+              .catch((error) => toast(api, String(error), "error"));
+          },
+        }))}
+      />
+    ),
+    () => void manageFleet(api, store, client),
+  );
+}
+
+export function nextFleetMemberID(
+  providerID: string,
+  modelID: string,
+  memberIDs: string[],
+) {
+  const used = new Set(memberIDs);
+  const provider = slug(providerID) || "model";
+  if (!used.has(provider)) return provider;
+  const model = slug(modelID) || "seat";
+  const base = `${provider}-${model}`;
+  if (!used.has(base)) return base;
+  let suffix = 2;
+  while (used.has(`${base}-${suffix}`)) suffix += 1;
+  return `${base}-${suffix}`;
+}
+
+function slug(value: string) {
+  return value
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
 async function selectCollaboration(
   api: TuiPluginApi,
   store: StateStore,
   options: MultiModelOptions,
+  composer: ComposerController,
 ) {
   const state = await store.read();
   if (state.fleet.members.length === 0)
     return toast(api, "Fleet is empty.", "warning");
-  const returnRoute = api.route.current;
   const DialogSelect = api.ui.DialogSelect;
   api.ui.dialog.replace(() => (
     <DialogSelect
@@ -1234,24 +1457,25 @@ async function selectCollaboration(
         value: mode,
         description: modeDescription(mode),
         onSelect() {
-          askForInput(
-            api,
-            "Collaboration request",
-            "What should the fleet do?",
-            async (prompt) => {
-              const sessionID = await parentSession(api);
-              api.route.navigate(ROUTE_COLLAB, {
-                mode,
-                prompt,
-                sessionID,
-                returnRoute,
-              });
-            },
-          );
+          const prompt = composer.ref(api.route.current);
+          if (!prompt) {
+            toast(api, "Open /collab from a session composer.", "warning");
+            return;
+          }
+          prompt.set({
+            ...prompt.current,
+            input: collaborationComposerInput(mode),
+          });
+          prompt.focus();
+          api.ui.dialog.clear();
         },
       }))}
     />
   ));
+}
+
+export function collaborationComposerInput(mode: CollabMode) {
+  return `/collab ${mode} `;
 }
 
 async function selectWorkflow(

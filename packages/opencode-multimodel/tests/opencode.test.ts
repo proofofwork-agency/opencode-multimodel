@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   asOpenCodeClient,
   discoverFleet,
+  listAvailableFleetModels,
   OpenCodeAgentRunner,
 } from "../src/opencode.ts";
 import { StateStore } from "../src/state.ts";
@@ -140,6 +141,15 @@ describe("OpenCode child-session adapter", () => {
     ]);
     expect(discovered.members[0]?.model.modelID).toBe("gpt-codex");
     expect(discovered.members[2]?.model.modelID).toBe("grok");
+
+    const available = await listAvailableFleetModels(client);
+    expect(available.map((item) =>
+      `${item.providerID}/${item.modelID}`
+    )).toEqual([
+      "codex-delegate/gpt-codex",
+      "anthropic/claude",
+      "xai/grok",
+    ]);
   });
 
   test("reuses persisted child sessions after a runner restart", async () => {
