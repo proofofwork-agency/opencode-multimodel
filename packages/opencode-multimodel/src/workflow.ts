@@ -2,9 +2,9 @@ import { mapLimit } from "./concurrency.ts";
 import { collaborationSystem } from "./prompts.ts";
 import type {
   AgentRunner,
+  DagWorkflowDefinition,
   Fleet,
   FleetMember,
-  WorkflowDefinition,
   WorkflowRun,
   WorkflowRunOptions,
   WorkflowStep,
@@ -21,15 +21,18 @@ export class WorkflowValidationError extends Error {
   }
 }
 
-export function validateWorkflow(definition: WorkflowDefinition) {
-  if (!definition.name.trim())
+export function validateWorkflow(definition: DagWorkflowDefinition) {
+  if (!definition.name.trim()) {
     throw new WorkflowValidationError("Workflow name is required.");
-  if (definition.steps.length === 0)
+  }
+  if (definition.steps.length === 0) {
     throw new WorkflowValidationError(
       "Workflow must contain at least one step.",
     );
-  if (definition.steps.length > MAX_STEPS)
+  }
+  if (definition.steps.length > MAX_STEPS) {
     throw new WorkflowValidationError(`Workflow exceeds ${MAX_STEPS} steps.`);
+  }
   const ids = new Set<string>();
   definition.steps.forEach((step) => {
     if (!/^[a-zA-Z0-9_-]+$/.test(step.id)) {
@@ -37,23 +40,27 @@ export function validateWorkflow(definition: WorkflowDefinition) {
         `Invalid step id ${step.id}. Use letters, numbers, _ or -.`,
       );
     }
-    if (ids.has(step.id))
+    if (ids.has(step.id)) {
       throw new WorkflowValidationError(`Duplicate step id ${step.id}.`);
-    if (!step.prompt.trim())
+    }
+    if (!step.prompt.trim()) {
       throw new WorkflowValidationError(`Step ${step.id} has an empty prompt.`);
+    }
     ids.add(step.id);
   });
   definition.steps.forEach((step) =>
     (step.needs ?? []).forEach((dependency) => {
-      if (!ids.has(dependency))
+      if (!ids.has(dependency)) {
         throw new WorkflowValidationError(
           `Step ${step.id} needs missing step ${dependency}.`,
         );
-      if (dependency === step.id)
+      }
+      if (dependency === step.id) {
         throw new WorkflowValidationError(
           `Step ${step.id} cannot depend on itself.`,
         );
-    }),
+      }
+    })
   );
   const remaining = new Set(ids);
   while (remaining.size > 0) {
@@ -63,10 +70,11 @@ export function validateWorkflow(definition: WorkflowDefinition) {
         (dependency) => !remaining.has(dependency),
       );
     });
-    if (ready.length === 0)
+    if (ready.length === 0) {
       throw new WorkflowValidationError(
         "Workflow contains a dependency cycle.",
       );
+    }
     ready.forEach((id) => remaining.delete(id));
   }
   return definition;
@@ -76,7 +84,7 @@ export async function runWorkflow(
   runner: AgentRunner,
   fleet: Fleet,
   parentSessionID: string,
-  definition: WorkflowDefinition,
+  definition: DagWorkflowDefinition,
   input: string,
   options: WorkflowRunOptions = {},
 ) {
@@ -84,39 +92,54 @@ export async function runWorkflow(
   const lead = fleet.members.find(
     (member) => member.id === fleet.leadID && member.enabled,
   );
-  if (!lead)
+  if (!lead) {
     throw new Error(`Fleet lead ${fleet.leadID} is missing or disabled.`);
+  }
   const createdAt = Date.now();
-  const run: WorkflowRun = {
-    id: `workflow_${crypto.randomUUID()}`,
-    definition: definition.name,
-    sessionID: parentSessionID,
-    input,
-    status: "pending",
-    steps: definition.steps.map((step) => ({
-      id: step.id,
+  const run: WorkflowRun = options.run
+    ? structuredClone(options.run)
+    : {
+      id: options.runID ?? `workflow_${crypto.randomUUID()}`,
+      kind: "workflow",
+      workflowKind: "dag",
+      definition: definition.name,
+      sessionID: parentSessionID,
+      messageID: options.messageID,
+      input,
       status: "pending",
-      memberID: step.memberID ?? lead.id,
-    })),
-    createdAt,
-    updatedAt: createdAt,
-  };
+      background: options.background,
+      steps: definition.steps.map((step) => ({
+        id: step.id,
+        status: "pending",
+        memberID: step.memberID ?? lead.id,
+      })),
+      createdAt,
+      updatedAt: createdAt,
+    };
+  run.steps.forEach((step) => {
+    if (step.status !== "running" && step.status !== "interrupted") return;
+    step.status = "pending";
+    step.error = undefined;
+    step.startedAt = undefined;
+    step.completedAt = undefined;
+  });
   await update(run, options, () => {
     run.status = "running";
+    run.error = undefined;
   });
 
   try {
     while (run.steps.some((step) => step.status === "pending")) {
       options.signal?.throwIfAborted();
+      await options.beforeStep?.(structuredClone(run));
+      options.signal?.throwIfAborted();
       cancelBlockedSteps(run, definition);
       const ready = definition.steps.filter((step) => {
         const state = findRunStep(run, step.id);
-        return (
-          state.status === "pending" &&
+        return state.status === "pending" &&
           (step.needs ?? []).every((dependency) =>
-            isTerminal(findRunStep(run, dependency)),
-          )
-        );
+            isTerminal(findRunStep(run, dependency))
+          );
       });
       if (
         ready.length === 0 &&
@@ -126,19 +149,22 @@ export async function runWorkflow(
       }
       await mapLimit(
         ready,
-        Math.min(Math.max(1, definition.maxParallel ?? 3), MAX_PARALLEL),
-        (step) =>
-          executeStep(
-            runner,
-            fleet,
-            lead,
-            parentSessionID,
-            definition,
-            step,
-            run,
-            options,
-          ),
+        Math.min(
+          Math.max(1, options.maxParallel ?? definition.maxParallel ?? 3),
+          MAX_PARALLEL,
+        ),
+        (step) => executeStep(
+          runner,
+          fleet,
+          lead,
+          parentSessionID,
+          definition,
+          step,
+          run,
+          options,
+        ),
       );
+      options.signal?.throwIfAborted();
       const hardFailure = definition.steps.find((step) => {
         const state = findRunStep(run, step.id);
         return state.status === "failed" && step.continueOnError !== true;
@@ -161,15 +187,15 @@ export async function runWorkflow(
 
     if (definition.synthesize) {
       options.signal?.throwIfAborted();
+      await options.beforeStep?.(structuredClone(run));
       const response = await runner.run({
         parentSessionID,
         member: lead,
         prompt: [
           `Workflow **${definition.name}** input:\n${input}`,
           "Step results:",
-          ...run.steps.map(
-            (step) =>
-              `### ${step.id} (${step.status})\n${step.output ?? step.error ?? "No output"}`,
+          ...run.steps.map((step) =>
+            `### ${step.id} (${step.status})\n${step.output ?? step.error ?? "No output"}`
           ),
           "As LEAD, synthesize the final workflow result for the user.",
         ].join("\n\n"),
@@ -179,6 +205,9 @@ export async function runWorkflow(
           fleet.members.filter((member) => member.enabled),
         ),
         signal: options.signal,
+        runID: run.id,
+        stepID: "__synthesize",
+        callIndex: definition.steps.length,
       });
       await update(run, options, () => {
         run.final = response.text;
@@ -186,10 +215,9 @@ export async function runWorkflow(
     }
 
     await update(run, options, () => {
-      run.status = definition.steps.some(
-        (step) =>
+      run.status = definition.steps.some((step) =>
           findRunStep(run, step.id).status === "failed" &&
-          step.continueOnError !== true,
+          step.continueOnError !== true
       )
         ? "failed"
         : "completed";
@@ -202,16 +230,14 @@ export async function runWorkflow(
       run.status = cancelled ? "cancelled" : "failed";
       run.error = error instanceof Error ? error.message : String(error);
       run.steps
-        .filter(
-          (step) => step.status === "pending" || step.status === "running",
-        )
+        .filter((step) => step.status === "pending" || step.status === "running")
         .forEach((step) => {
           step.status = "cancelled";
           step.error = cancelled ? "Workflow cancelled." : "Workflow stopped.";
           step.completedAt = Date.now();
         });
     });
-    if (cancelled) await runner.cancel?.(parentSessionID);
+    if (cancelled) await runner.cancel?.(parentSessionID, run.id);
     return run;
   }
 }
@@ -221,7 +247,7 @@ async function executeStep(
   fleet: Fleet,
   lead: FleetMember,
   parentSessionID: string,
-  definition: WorkflowDefinition,
+  definition: DagWorkflowDefinition,
   step: WorkflowStep,
   run: WorkflowRun,
   options: WorkflowRunOptions,
@@ -246,16 +272,20 @@ async function executeStep(
         `You are executing declarative workflow **${definition.name}**, step **${step.id}**. Return only this step's concrete result.`,
       ].join("\n\n"),
       signal: options.signal,
+      runID: run.id,
+      stepID: step.id,
+      callIndex: definition.steps.findIndex((item) => item.id === step.id),
     });
     await update(run, options, () => {
       state.status = "completed";
       state.memberID = member.id;
       state.output = response.text;
+      state.error = undefined;
       state.completedAt = Date.now();
     });
   } catch (error) {
     await update(run, options, () => {
-      state.status = "failed";
+      state.status = options.signal?.aborted ? "cancelled" : "failed";
       state.memberID = member.id;
       state.error = error instanceof Error ? error.message : String(error);
       state.completedAt = Date.now();
@@ -265,14 +295,15 @@ async function executeStep(
 
 function workflowMember(fleet: Fleet, lead: FleetMember, step: WorkflowStep) {
   const base = step.memberID
-    ? fleet.members.find(
-        (member) => member.id === step.memberID && member.enabled,
-      )
+    ? fleet.members.find((member) =>
+      member.id === step.memberID && member.enabled
+    )
     : lead;
-  if (!base)
+  if (!base) {
     throw new Error(
       `Workflow step ${step.id} selects missing or disabled member ${step.memberID}.`,
     );
+  }
   if (!step.model && !step.agent) return base;
   return {
     ...base,
@@ -284,8 +315,8 @@ function workflowMember(fleet: Fleet, lead: FleetMember, step: WorkflowStep) {
 function inputValues(run: WorkflowRun) {
   return Object.fromEntries([
     ["input", run.input],
-    ...run.steps.map(
-      (step) => [step.id, step.output ?? step.error ?? ""] as const,
+    ...run.steps.map((step) =>
+      [step.id, step.output ?? step.error ?? ""] as const
     ),
   ]);
 }
@@ -297,7 +328,10 @@ export function interpolate(template: string, values: Record<string, string>) {
   );
 }
 
-function cancelBlockedSteps(run: WorkflowRun, definition: WorkflowDefinition) {
+function cancelBlockedSteps(
+  run: WorkflowRun,
+  definition: DagWorkflowDefinition,
+) {
   definition.steps.forEach((step) => {
     const state = findRunStep(run, step.id);
     if (state.status !== "pending") return;
@@ -324,11 +358,9 @@ function findRunStep(run: WorkflowRun, id: string): WorkflowStepRun {
 }
 
 function isTerminal(step: WorkflowStepRun) {
-  return (
-    step.status === "completed" ||
+  return step.status === "completed" ||
     step.status === "failed" ||
-    step.status === "cancelled"
-  );
+    step.status === "cancelled";
 }
 
 async function update(

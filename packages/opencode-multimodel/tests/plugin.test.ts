@@ -14,6 +14,24 @@ test("publishes separate valid OpenCode server and TUI modules", () => {
 
 test("server plugin registers fleet, collaboration and workflow surfaces", async () => {
   const directory = `${process.env.TMPDIR ?? "/tmp"}/opencode-multimodel-${crypto.randomUUID()}`;
+  let serverRequests = 0;
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      serverRequests += 1;
+      const path = new URL(request.url).pathname;
+      if (request.method === "POST" && path === "/session") {
+        return Response.json({ id: "child" });
+      }
+      if (request.method === "POST" && path === "/session/child/message") {
+        return Response.json({ parts: [{ type: "text", text: "answer" }] });
+      }
+      if (request.method === "POST" && path === "/session/child/abort") {
+        return Response.json(true);
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
   const fleet: Fleet = {
     leadID: "lead",
     members: [
@@ -26,22 +44,32 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
     ],
   };
   const asked: string[] = [];
+  const legacyCalls: unknown[] = [];
   const plugin = await serverModule.server(
     {
       directory,
       client: {
         session: {
-          async create() {
+          async create(input: unknown) {
+            legacyCalls.push(input);
             return { data: { id: "child" } };
           },
-          async prompt() {
+          async prompt(input: unknown) {
+            legacyCalls.push(input);
             return { data: { parts: [{ type: "text", text: "answer" }] } };
           },
-          async abort() {
+          async abort(input: unknown) {
+            legacyCalls.push(input);
             return { data: true };
           },
         },
+        provider: {
+          async list() {
+            return { data: { all: [] } };
+          },
+        },
       },
+      serverUrl: new URL(server.url),
     } as never,
     { statePath: `${directory}/state.json`, fleet },
   );
@@ -57,9 +85,17 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
       "workflows",
     ]),
   );
+  expect(config.command?.collab?.template).toContain(
+    "copy every character after the following whitespace into prompt",
+  );
+  expect(config.command?.collab?.template).toContain(
+    "MUST NOT be empty",
+  );
+  expect(config.command?.mode).toBeUndefined();
   expect(Object.keys(plugin.tool ?? {})).toEqual([
     "multimodel_fleet",
     "multimodel_collab",
+    "multimodel_run",
     "multimodel_workflow",
   ]);
   const output = await plugin.tool?.multimodel_fleet?.execute(
@@ -67,6 +103,14 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
     {} as never,
   );
   expect(output).toContain("Lead: lead");
+  await plugin.tool?.multimodel_fleet?.execute(
+    { action: "set-lead", memberID: "lead" },
+    {
+      async ask(input: { permission: string }) {
+        asked.push(input.permission);
+      },
+    } as never,
+  );
   const collaboration = await plugin.tool?.multimodel_collab?.execute(
     { prompt: "Question", mode: "lead" },
     {
@@ -79,11 +123,82 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
     } as never,
   );
   expect(collaboration).toMatchObject({
-    title: "lead: lead",
+    title: "lead: completed",
     output: "answer",
   });
-  expect(asked).toEqual(["multimodel.collab"]);
+  expect(serverRequests).toBe(0);
+  expect(legacyCalls).toEqual([
+    {
+      body: {
+        parentID: "parent",
+        title: "Fleet: lead (test/model)",
+      },
+    },
+    {
+      path: { id: "child" },
+      body: {
+        model: { providerID: "test", modelID: "model" },
+        agent: undefined,
+        system: expect.any(String),
+        tools: {
+          multimodel_collab: false,
+          multimodel_fleet: false,
+          multimodel_run: false,
+          multimodel_workflow: false,
+          codex_delegate: false,
+          codex_review: false,
+          codex_status: false,
+          codex_steer: false,
+          codex_cancel: false,
+          codex_probe: false,
+        },
+        parts: [{ type: "text", text: expect.any(String) }],
+      },
+    },
+  ]);
+  expect(asked).toEqual(["multimodel.fleet", "multimodel.collab"]);
   await plugin.dispose?.();
+  server.stop(true);
+});
+
+test("defers provider discovery until the server is fully bootstrapped", async () => {
+  const directory = `${process.env.TMPDIR ?? "/tmp"}/opencode-multimodel-discovery-${crypto.randomUUID()}`;
+  let providerRequests = 0;
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      if (new URL(request.url).pathname !== "/provider") {
+        return new Response("not found", { status: 404 });
+      }
+      providerRequests += 1;
+      return Response.json({
+        connected: ["openai"],
+        default: { openai: "gpt-test" },
+        all: [{
+          id: "openai",
+          name: "OpenAI",
+          models: { "gpt-test": { id: "gpt-test", name: "GPT Test" } },
+        }],
+      });
+    },
+  });
+  const plugin = await serverModule.server(
+    {
+      directory,
+      serverUrl: new URL(server.url),
+    } as never,
+  );
+
+  expect(providerRequests).toBe(0);
+  const output = await plugin.tool?.multimodel_fleet?.execute(
+    { action: "list" },
+    {} as never,
+  );
+  expect(providerRequests).toBe(1);
+  expect(output).toContain("openai/gpt-test");
+
+  await plugin.dispose?.();
+  server.stop(true);
 });
 
 test("TUI plugin registers slash commands and dedicated routes", async () => {
@@ -160,7 +275,19 @@ test("TUI plugin registers slash commands and dedicated routes", async () => {
     "multimodel.collab",
     "multimodel.workflows",
     "multimodel.workflow",
+    "multimodel.runs",
+    "multimodel.run",
+    "multimodel.graph",
   ]);
-  expect(slash).toEqual(["fleet", "lead", "collab", "workflow", "workflows"]);
+  expect(slash).toEqual([
+    "fleet",
+    "lead",
+    "collab",
+    "workflow",
+    "workflows",
+    "mode",
+    "runs",
+    "graph",
+  ]);
   await Promise.all(dispose.map((fn) => fn()));
 });

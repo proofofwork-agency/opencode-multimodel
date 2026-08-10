@@ -1,27 +1,63 @@
+import { isAbsolute, resolve } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
-import { collaborate } from "./collaborate.ts";
+import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import {
+  adaptPluginClient,
   asOpenCodeClient,
   discoverFleet,
   OpenCodeAgentRunner,
 } from "./opencode.ts";
+import { RunService } from "./orchestration.ts";
 import { parseOptions } from "./options.ts";
-import { defaultStatePath, StateStore } from "./state.ts";
+import { validateWorkflowScript } from "./script.ts";
+import {
+  resolveDatabasePath,
+  StateStore,
+  workflowSourceHash,
+} from "./state.ts";
 import {
   COLLAB_MODES,
+  isDagWorkflow,
+  isWorkflowRun,
   type CollabMode,
+  type DurableRun,
   type WorkflowDefinition,
 } from "./types.ts";
-import { runWorkflow, validateWorkflow } from "./workflow.ts";
+import { validateWorkflow } from "./workflow.ts";
+import {
+  loadWorkflowDirectories,
+  parseWorkflowDefinition,
+} from "./workflow-files.ts";
 
 const server: Plugin = async (input, rawOptions) => {
   const options = parseOptions(rawOptions);
-  const client = asOpenCodeClient(input.client);
+  const client = input.client
+    ? adaptPluginClient(input.client)
+    : asOpenCodeClient(createOpencodeClient({
+      baseUrl: input.serverUrl?.toString(),
+      directory: input.directory,
+    }));
   const store = new StateStore(
-    options.statePath ?? defaultStatePath(input.directory),
+    resolveDatabasePath(input.directory, options.databasePath),
+    {
+      legacyPath: options.statePath
+        ? absolute(input.directory, options.statePath)
+        : undefined,
+      retention: options.retention,
+    },
   );
-  await store.initializeFleet(options.fleet ?? (await discoverFleet(client)));
-  const runner = new OpenCodeAgentRunner(client);
+  await store.initializeFleet(options.fleet ?? { leadID: "lead", members: [] });
+  await loadWorkflowDirectories(store, input.directory, options.workflows);
+  const runner = new OpenCodeAgentRunner(client, store);
+  const runs = new RunService(store, runner, options);
+  const readState = async (discover = false) => {
+    const state = await store.read();
+    if (!discover || options.fleet || state.fleet.members.length > 0) {
+      return state;
+    }
+    await store.initializeFleet(await discoverFleet(client));
+    return store.read();
+  };
 
   return {
     async config(config) {
@@ -38,10 +74,21 @@ const server: Plugin = async (input, rawOptions) => {
       };
       config.command.collab ??= {
         description: "Run a multi-model collaboration",
-        template: `Call multimodel_collab for this request. Use mode ${options.defaultMode} unless the first argument names a mode. Request: $ARGUMENTS`,
+        template: `Act only as a deterministic command adapter. Do not answer the user's request yourself. Call multimodel_collab exactly once and return its tool result verbatim.
+
+The raw command arguments are between the delimiters below:
+<multimodel_arguments>
+$ARGUMENTS
+</multimodel_arguments>
+
+Parsing rules:
+1. Read the first whitespace-delimited token.
+2. If it is one of ${COLLAB_MODES.join(", ")}, pass that exact token as mode and copy every character after the following whitespace into prompt.
+3. Otherwise pass mode=${options.defaultMode} and copy all raw command arguments into prompt.
+4. The prompt is required. If text remains after a recognized mode, the tool's prompt argument MUST contain that complete text verbatim and MUST NOT be empty.`,
       };
       config.command.workflow ??= {
-        description: "Run a declarative multi-model workflow",
+        description: "Run a durable multi-model workflow",
         template:
           "Call multimodel_workflow with action=run. Treat the first argument as name and the remaining text as input: $ARGUMENTS",
       };
@@ -54,63 +101,95 @@ const server: Plugin = async (input, rawOptions) => {
     tool: {
       multimodel_fleet: tool({
         description:
-          "List or configure the OpenCode multi-model fleet and select its lead.",
+          "List or configure the durable OpenCode multi-model fleet, its lead, enabled state, and isolation.",
         args: {
-          action: tool.schema.enum(["list", "set-lead", "add", "remove"]),
+          action: tool.schema.enum([
+            "list",
+            "set-lead",
+            "add",
+            "update",
+            "remove",
+            "enable",
+            "disable",
+          ]),
           memberID: tool.schema.string().optional(),
           role: tool.schema.string().optional(),
           providerID: tool.schema.string().optional(),
           modelID: tool.schema.string().optional(),
           agent: tool.schema.string().optional(),
+          isolation: tool.schema.enum(["shared", "worktree"]).optional(),
         },
-        async execute(args) {
-          if (args.action === "set-lead") {
-            if (!args.memberID)
-              throw new Error("memberID is required for set-lead.");
-            await store.setLead(args.memberID);
-          }
-          if (args.action === "remove") {
-            if (!args.memberID)
-              throw new Error("memberID is required for remove.");
-            await store.removeMember(args.memberID);
-          }
-          if (args.action === "add") {
-            if (!args.memberID || !args.providerID || !args.modelID) {
-              throw new Error(
-                "memberID, providerID and modelID are required for add.",
-              );
-            }
-            await store.upsertMember({
-              id: args.memberID,
-              role: args.role ?? "specialist",
-              model: { providerID: args.providerID, modelID: args.modelID },
-              agent: args.agent,
-              enabled: true,
+        async execute(args, context) {
+          if (args.action !== "list") {
+            const memberID = requireText(args.memberID, "memberID");
+            const pattern = `${args.action}:${memberID}`;
+            await context.ask({
+              permission: "multimodel.fleet",
+              patterns: [pattern],
+              always: [pattern],
+              metadata: { action: args.action, memberID },
             });
           }
-          return formatFleet((await store.read()).fleet);
+          if (args.action === "set-lead") {
+            await store.setLead(requireText(args.memberID, "memberID"));
+          }
+          if (args.action === "remove") {
+            await store.removeMember(requireText(args.memberID, "memberID"));
+          }
+          if (args.action === "enable" || args.action === "disable") {
+            await store.enableMember(
+              requireText(args.memberID, "memberID"),
+              args.action === "enable",
+            );
+          }
+          if (args.action === "add" || args.action === "update") {
+            const state = await readState();
+            const memberID = requireText(args.memberID, "memberID");
+            const existing = state.fleet.members.find((member) =>
+              member.id === memberID
+            );
+            if (args.action === "update" && !existing) {
+              throw new Error(`Fleet member ${memberID} does not exist.`);
+            }
+            await store.upsertMember({
+              id: memberID,
+              role: args.role ?? existing?.role ?? "specialist",
+              model: {
+                providerID: args.providerID ?? existing?.model.providerID ??
+                  requireText(args.providerID, "providerID"),
+                modelID: args.modelID ?? existing?.model.modelID ??
+                  requireText(args.modelID, "modelID"),
+              },
+              agent: args.agent ?? existing?.agent,
+              enabled: existing?.enabled ?? true,
+              isolation: args.isolation ?? existing?.isolation ?? "shared",
+            });
+          }
+          return formatFleet((await readState(args.action === "list")).fleet);
         },
       }),
       multimodel_collab: tool({
         description:
-          "Run several OpenCode provider models concurrently using a Poly-derived collaboration mode, with a selected lead.",
+          "Start a foreground or background multi-model collaboration. Always pass the complete user request in prompt; never omit or answer it outside the tool.",
         args: {
-          prompt: tool.schema
-            .string()
-            .describe("The task or question for the fleet"),
+          prompt: tool.schema.string().min(1).describe(
+            "Required complete collaboration request, copied verbatim from the command after its optional mode token. Never pass an empty string.",
+          ),
           mode: tool.schema.enum(COLLAB_MODES).optional(),
           participants: tool.schema.array(tool.schema.string()).optional(),
           handoffTo: tool.schema.string().optional(),
           juryRounds: tool.schema
             .union([tool.schema.literal(1), tool.schema.literal(2)])
             .optional(),
+          background: tool.schema.boolean().optional(),
         },
         async execute(args, context) {
-          const state = await store.read();
-          if (state.fleet.members.length === 0)
+          const state = await readState(true);
+          if (state.fleet.members.length === 0) {
             throw new Error(
               "The fleet is empty. Add a model with multimodel_fleet first.",
             );
+          }
           const mode = (args.mode ?? options.defaultMode) as CollabMode;
           await context.ask({
             permission: "multimodel.collab",
@@ -118,111 +197,194 @@ const server: Plugin = async (input, rawOptions) => {
             always: ["*"],
             metadata: {
               mode,
-              participants:
-                args.participants ??
+              participants: args.participants ??
                 state.fleet.members.map((member) => member.id),
+              background: args.background === true,
             },
           });
-          const result = await collaborate(
-            runner,
-            state.fleet,
-            context.sessionID,
-            args.prompt,
-            {
-              mode,
-              participants: args.participants,
-              handoffTo: args.handoffTo,
-              juryRounds: args.juryRounds,
-              maxWorkers: options.maxWorkers,
-              maxParallel: options.maxParallel,
-              signal: context.abort,
-              onActivity(event) {
-                context.metadata({
-                  title: `${event.memberID}: ${event.phase}`,
-                  metadata: event,
-                });
-              },
+          const run = await runs.startCollaboration({
+            sessionID: context.sessionID,
+            messageID: context.messageID,
+            prompt: args.prompt,
+            mode,
+            participants: args.participants,
+            handoffTo: args.handoffTo,
+            juryRounds: args.juryRounds,
+            background: args.background,
+            signal: args.background ? undefined : context.abort,
+            onActivity(event) {
+              context.metadata({
+                title: `${event.memberID}: ${event.phase}`,
+                metadata: { runID: undefined, ...event },
+              });
             },
-          );
-          return {
-            title: `${result.mode}: ${result.participants.join(", ")}`,
-            output: result.final.text,
-            metadata: {
-              mode: result.mode,
-              leadID: result.leadID,
-              participants: result.participants,
-              sessions: Object.fromEntries(
-                result.replies
-                  .filter((reply) => reply.sessionID)
-                  .map((reply) => [reply.memberID, reply.sessionID]),
-              ),
-              majority: result.jury?.majority,
-            },
-          };
+          });
+          return runOutput(run);
+        },
+      }),
+      multimodel_run: tool({
+        description:
+          "Inspect, cancel, steer, resume, or clean up workspaces for durable multi-model runs.",
+        args: {
+          action: tool.schema.enum([
+            "list",
+            "get",
+            "cancel",
+            "steer",
+            "resume",
+            "cleanup-workspaces",
+          ]),
+          runID: tool.schema.string().optional(),
+          prompt: tool.schema.string().optional(),
+        },
+        async execute(args, context) {
+          if (args.action === "list") {
+            return JSON.stringify(await store.listRuns(100), null, 2);
+          }
+          if (args.action === "cleanup-workspaces") {
+            const count = await runs.cleanupWorkspaces(args.runID);
+            return `Removed ${count} preserved workspace${count === 1 ? "" : "s"}.`;
+          }
+          const runID = requireText(args.runID, "runID");
+          if (args.action === "get") {
+            const run = await store.getRun(runID);
+            if (!run) throw new Error(`Run ${runID} does not exist.`);
+            return JSON.stringify(run, null, 2);
+          }
+          await context.ask({
+            permission: `multimodel.run.${args.action}`,
+            patterns: [runID],
+            always: [runID],
+            metadata: { runID },
+          });
+          if (args.action === "cancel") await runs.cancel(runID);
+          if (args.action === "resume") await runs.resume(runID);
+          if (args.action === "steer") {
+            await runs.steer(runID, requireText(args.prompt, "prompt"));
+          }
+          return runOutput((await store.getRun(runID))!);
         },
       }),
       multimodel_workflow: tool({
         description:
-          "Save, list, run, or inspect safe declarative multi-model DAG workflows.",
+          "Save, inspect, run, pause, resume, stop, or restart durable DAG and confined script workflows.",
         args: {
-          action: tool.schema.enum(["list", "save", "run", "history"]),
+          action: tool.schema.enum([
+            "list",
+            "save",
+            "inspect",
+            "run",
+            "history",
+            "pause",
+            "resume",
+            "stop",
+            "restart-agent",
+          ]),
           name: tool.schema.string().optional(),
+          runID: tool.schema.string().optional(),
+          stepID: tool.schema.string().optional(),
           input: tool.schema.string().optional(),
+          background: tool.schema.boolean().optional(),
           definition: tool.schema
             .string()
             .optional()
-            .describe("Workflow definition as JSON for save"),
+            .describe("DAG or confined script workflow definition as JSON"),
         },
         async execute(args, context) {
-          const state = await store.read();
-          if (args.action === "list")
+          const state = await readState(args.action === "run");
+          if (args.action === "list") {
             return formatWorkflows(state.workflows, state.runs);
-          if (args.action === "history")
-            return JSON.stringify(state.runs.slice(-20), null, 2);
-          if (args.action === "save") {
-            if (!args.definition)
-              throw new Error("definition JSON is required for save.");
-            const definition = parseWorkflow(args.definition);
-            validateWorkflow(definition);
-            await store.saveWorkflow(definition);
-            return `Saved workflow ${definition.name} with ${definition.steps.length} steps.`;
           }
-          if (!args.name) throw new Error("name is required for run.");
-          const definition = state.workflows.find(
-            (workflow) => workflow.name === args.name,
+          if (args.action === "history") {
+            return JSON.stringify(
+              state.runs.filter(isWorkflowRun).slice(0, 20),
+              null,
+              2,
+            );
+          }
+          if (args.action === "inspect") {
+            const name = requireText(args.name, "name");
+            const definition = state.workflows.find((item) => item.name === name);
+            if (!definition) throw new Error(`Workflow ${name} does not exist.`);
+            return JSON.stringify(definition, null, 2);
+          }
+          if (args.action === "save") {
+            const definition = parseWorkflowDefinition(
+              requireText(args.definition, "definition"),
+            );
+            if (definition.kind === "script") {
+              if (!options.workflows.scripts) {
+                throw new Error(
+                  "Script workflows are disabled. Set workflows.scripts=true to enable them.",
+                );
+              }
+              const validated = validateWorkflowScript(definition.source);
+              definition.sourceHash = validated.sourceHash;
+            } else {
+              validateWorkflow(definition);
+            }
+            await store.saveWorkflow(definition);
+            return `Saved ${definition.kind ?? "dag"} workflow ${definition.name}.`;
+          }
+          if (args.action === "pause" || args.action === "resume" ||
+            args.action === "stop" || args.action === "restart-agent") {
+            const runID = requireText(args.runID, "runID");
+            await context.ask({
+              permission: `multimodel.workflow.${args.action}`,
+              patterns: [runID],
+              always: [runID],
+              metadata: { runID },
+            });
+            if (args.action === "pause") await runs.pause(runID);
+            if (args.action === "resume") await runs.resume(runID);
+            if (args.action === "stop") await runs.stop(runID);
+            if (args.action === "restart-agent") {
+              await runs.restartAgent(
+                runID,
+                requireText(args.stepID, "stepID"),
+              );
+            }
+            return runOutput((await store.getRun(runID))!);
+          }
+          const name = requireText(args.name, "name");
+          const definition = state.workflows.find((workflow) =>
+            workflow.name === name
           );
-          if (!definition)
-            throw new Error(`Workflow ${args.name} does not exist.`);
+          if (!definition) throw new Error(`Workflow ${name} does not exist.`);
+          if (definition.kind === "script" && !options.workflows.scripts) {
+            throw new Error("Script workflows are disabled by configuration.");
+          }
+          const pattern = definition.kind === "script"
+            ? `${definition.name}:${workflowSourceHash(definition.source)}`
+            : definition.name;
           await context.ask({
             permission: "multimodel.workflow",
-            patterns: [definition.name],
-            always: ["*"],
+            patterns: [pattern],
+            always: [pattern],
             metadata: {
               workflow: definition.name,
-              steps: definition.steps.length,
+              kind: definition.kind ?? "dag",
+              sourceHash: definition.kind === "script"
+                ? workflowSourceHash(definition.source)
+                : undefined,
+              background: args.background === true,
             },
           });
-          const run = await runWorkflow(
-            runner,
-            state.fleet,
-            context.sessionID,
+          return runOutput(await runs.startWorkflow({
+            sessionID: context.sessionID,
+            messageID: context.messageID,
             definition,
-            args.input ?? "",
-            {
-              signal: context.abort,
-              onUpdate: (next) => store.saveRun(next).then(() => undefined),
-            },
-          );
-          return {
-            title: `${definition.name}: ${run.status}`,
-            output: run.final ?? run.error ?? `Workflow ${run.status}.`,
-            metadata: { runID: run.id, status: run.status, steps: run.steps },
-          };
+            input: args.input ?? "",
+            background: args.background,
+            signal: args.background ? undefined : context.abort,
+          }));
         },
       }),
     },
     async dispose() {
+      await runs.dispose();
       await runner.close();
+      await store.close();
     },
   };
 };
@@ -231,38 +393,57 @@ function formatFleet(fleet: Awaited<ReturnType<StateStore["read"]>>["fleet"]) {
   if (fleet.members.length === 0) return "Fleet is empty.";
   return [
     `Lead: ${fleet.leadID}`,
-    ...fleet.members.map(
-      (member) =>
-        `${member.id === fleet.leadID ? "*" : "-"} ${member.id} · ${member.role} · ${member.model.providerID}/${member.model.modelID} · agent=${member.agent ?? "default"}${member.enabled ? "" : " · disabled"}`,
+    ...fleet.members.map((member) =>
+      `${member.id === fleet.leadID ? "*" : "-"} ${member.id} · ${member.role} · ${member.model.providerID}/${member.model.modelID} · agent=${member.agent ?? "default"} · isolation=${member.isolation ?? "shared"}${member.enabled ? "" : " · disabled"}`
     ),
   ].join("\n");
 }
 
 function formatWorkflows(
-  workflows: Awaited<ReturnType<StateStore["read"]>>["workflows"],
-  runs: Awaited<ReturnType<StateStore["read"]>>["runs"],
+  workflows: WorkflowDefinition[],
+  runs: DurableRun[],
 ) {
   if (workflows.length === 0) return "No workflows saved.";
   return [
-    ...workflows.map(
-      (workflow) =>
-        `${workflow.name} · ${workflow.steps.length} steps${workflow.description ? ` · ${workflow.description}` : ""}`,
+    ...workflows.map((workflow) =>
+      workflow.kind === "script"
+        ? `${workflow.name} · script · sha256:${workflow.sourceHash ?? workflowSourceHash(workflow.source)}`
+        : `${workflow.name} · dag · ${workflow.steps.length} steps${workflow.description ? ` · ${workflow.description}` : ""}`
     ),
     "",
     `Recent runs: ${
       runs
-        .slice(-10)
+        .filter(isWorkflowRun)
+        .slice(0, 10)
         .map((run) => `${run.definition}/${run.status}`)
         .join(", ") || "none"
     }`,
   ].join("\n");
 }
 
-function parseWorkflow(value: string): WorkflowDefinition {
-  const parsed: unknown = JSON.parse(value);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-    throw new Error("Workflow definition must be an object.");
-  return parsed as WorkflowDefinition;
+function runOutput(run: DurableRun) {
+  return {
+    title: `${run.definition}: ${run.status}`,
+    output: run.background && run.status === "pending"
+      ? `Background run ${run.id} was admitted.`
+      : run.final ?? run.error ?? `Run ${run.id} is ${run.status}.`,
+    metadata: {
+      runID: run.id,
+      kind: run.kind,
+      status: run.status,
+      background: run.background === true,
+      steps: run.steps,
+    },
+  };
+}
+
+function requireText(value: string | undefined, name: string) {
+  if (value?.trim()) return value;
+  throw new Error(`${name} is required.`);
+}
+
+function absolute(directory: string, path: string) {
+  return isAbsolute(path) ? path : resolve(directory, path);
 }
 
 export default { id: "opencode-multimodel", server } satisfies PluginModule;

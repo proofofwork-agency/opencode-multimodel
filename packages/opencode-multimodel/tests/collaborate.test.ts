@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { collaborate, parseTasksBlock } from "../src/collaborate.ts";
+import { COLLAB_MODES } from "../src/types.ts";
 import type {
   AgentReply,
   AgentRunner,
@@ -64,6 +65,38 @@ class FakeRunner implements AgentRunner {
 }
 
 describe("Poly-derived collaboration modes", () => {
+  for (const mode of COLLAB_MODES) {
+    test(`${mode} completes with its declared routing semantics`, async () => {
+      const runner = new FakeRunner((input) => [
+        `POSITION: ${input.member.id} position`,
+        "VOTE: approve",
+        "CONFIDENCE: high",
+        "RATIONALE: Evidence",
+        "RISKS: None",
+        "ALTERNATIVE: None",
+      ].join("\n"));
+      const result = await collaborate(runner, fleet, "parent", "Smoke test", {
+        mode,
+        handoffTo: "codex",
+        juryRounds: 1,
+      });
+
+      expect(result.mode).toBe(mode);
+      expect(result.final.text.length).toBeGreaterThan(0);
+      expect(runner.calls.length).toBeGreaterThan(0);
+    });
+  }
+
+  test("lead records only the member that actually ran", async () => {
+    const runner = new FakeRunner(() => "lead answer");
+    const result = await collaborate(runner, fleet, "parent", "Answer", {
+      mode: "lead",
+    });
+
+    expect(runner.calls.map((call) => call.member.id)).toEqual(["lead"]);
+    expect(result.participants).toEqual(["lead"]);
+  });
+
   test("pair runs lead plan, worker response, and lead synthesis", async () => {
     const runner = new FakeRunner((input, index) =>
       index === 2 ? "final answer" : `${input.member.id} reply`,

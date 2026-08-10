@@ -1,0 +1,54 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseOptions } from "../src/options.ts";
+import { StateStore } from "../src/state.ts";
+import { loadWorkflowDirectories } from "../src/workflow-files.ts";
+
+const cleanup: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+  await Promise.allSettled(cleanup.splice(0).map((close) => close()));
+});
+
+describe("configured workflow directories", () => {
+  test("loads DAG files and gates script files behind workflows.scripts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "opencode-workflows-"));
+    const workflows = join(directory, ".opencode", "workflows");
+    await mkdir(workflows, { recursive: true });
+    await Bun.write(join(workflows, "review.json"), JSON.stringify({
+      kind: "dag",
+      name: "review",
+      steps: [{ id: "review", prompt: "Review ${input}" }],
+    }));
+    await Bun.write(
+      join(workflows, "script.ts"),
+      'export const meta = { name: "scripted" };\nexport default () => agent("lead", args("input"));',
+    );
+    const store = new StateStore(join(directory, "state.sqlite"));
+    cleanup.push(async () => {
+      await store.close();
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    await loadWorkflowDirectories(
+      store,
+      directory,
+      parseOptions(undefined).workflows,
+    );
+    expect((await store.read()).workflows.map((item) => item.name)).toEqual([
+      "review",
+    ]);
+
+    await loadWorkflowDirectories(
+      store,
+      directory,
+      parseOptions({ workflows: { scripts: true } }).workflows,
+    );
+    expect((await store.read()).workflows.map((item) => item.name)).toEqual([
+      "review",
+      "scripted",
+    ]);
+  });
+});
