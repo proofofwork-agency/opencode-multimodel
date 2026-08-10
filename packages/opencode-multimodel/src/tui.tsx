@@ -2,10 +2,13 @@ import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
+  TuiPromptInfo,
+  TuiPromptRef,
   TuiRouteCurrent,
 } from "@opencode-ai/plugin/tui";
 import type { JSX } from "@opentui/solid";
 import {
+  createEffect,
   createResource,
   createSignal,
   For,
@@ -13,34 +16,61 @@ import {
   onMount,
   Show,
 } from "solid-js";
-import { collaborate } from "./collaborate.ts";
 import {
   asOpenCodeClient,
   discoverFleet,
   OpenCodeAgentRunner,
 } from "./opencode.ts";
+import { RunService } from "./orchestration.ts";
 import { parseOptions, type MultiModelOptions } from "./options.ts";
-import { defaultStatePath, StateStore } from "./state.ts";
+import { resolveDatabasePath, StateStore } from "./state.ts";
 import {
   COLLAB_MODES,
   type CollabActivity,
   type CollabMode,
+  type ComposerMode,
+  type WorkflowDefinition,
 } from "./types.ts";
-import { runWorkflow } from "./workflow.ts";
+import { loadWorkflowDirectories } from "./workflow-files.ts";
 
 const ROUTE_FLEET = "multimodel.fleet";
 const ROUTE_COLLAB = "multimodel.collab";
 const ROUTE_WORKFLOWS = "multimodel.workflows";
 const ROUTE_WORKFLOW = "multimodel.workflow";
+const ROUTE_RUNS = "multimodel.runs";
+const ROUTE_RUN = "multimodel.run";
+const ROUTE_GRAPH = "multimodel.graph";
 
 const tui: TuiPlugin = async (api, rawOptions) => {
   const options = parseOptions(rawOptions);
   const client = asOpenCodeClient(api.client);
   const store = new StateStore(
-    options.statePath ?? defaultStatePath(api.state.path.directory),
+    resolveDatabasePath(api.state.path.directory, options.databasePath),
+    {
+      legacyPath: options.statePath
+        ? resolveDatabasePath(api.state.path.directory, options.statePath)
+        : undefined,
+      retention: options.retention,
+    },
   );
   await store.initializeFleet(options.fleet ?? (await discoverFleet(client)));
-  const runner = new OpenCodeAgentRunner(client);
+  await loadWorkflowDirectories(
+    store,
+    api.state.path.directory,
+    options.workflows,
+  );
+  const runner = new OpenCodeAgentRunner(client, store);
+  const runs = new RunService(store, runner, options);
+  const composer = createComposerController(
+    options,
+    (await store.read()).workflows,
+  );
+
+  if (options.composer.enabled && api.slots) {
+    registerComposerInputRouting(api, options, composer);
+    registerComposerSlots(api, store, options, composer);
+  }
+  watchBackgroundRuns(api, store, composer);
 
   api.route.register([
     {
@@ -55,7 +85,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         <CollabScreen
           api={api}
           store={store}
-          runner={runner}
+          runs={runs}
           options={options}
           params={params}
         />
@@ -73,9 +103,27 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         <WorkflowScreen
           api={api}
           store={store}
-          runner={runner}
+          runs={runs}
           params={params}
         />
+      ),
+    },
+    {
+      name: ROUTE_RUNS,
+      render: ({ params }) => (
+        <RunLedgerScreen api={api} store={store} params={params} />
+      ),
+    },
+    {
+      name: ROUTE_RUN,
+      render: ({ params }) => (
+        <RunDetailScreen api={api} store={store} params={params} />
+      ),
+    },
+    {
+      name: ROUTE_GRAPH,
+      render: ({ params }) => (
+        <GraphScreen api={api} store={store} params={params} />
       ),
     },
   ]);
@@ -124,7 +172,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         namespace: "palette",
         slashName: "workflow",
         run() {
-          void selectWorkflow(api, store);
+          void selectWorkflow(api, store, composer);
         },
       },
       {
@@ -141,10 +189,49 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           api.ui.dialog.clear();
         },
       },
+      {
+        name: "multimodel.mode",
+        title: "Composer mode: SINGLE · TEAM · WORKFLOW",
+        description: "Choose how normal TUI prompts are submitted",
+        category: "Multi-model",
+        namespace: "palette",
+        slashName: "mode",
+        run() {
+          void chooseComposerMode(api, store, options, composer);
+        },
+      },
+      {
+        name: "multimodel.runs",
+        title: "Multi-model run ledger",
+        description: "Inspect foreground and background orchestration runs",
+        category: "Multi-model",
+        namespace: "palette",
+        slashName: "runs",
+        run() {
+          api.route.navigate(ROUTE_RUNS, { returnRoute: api.route.current });
+          api.ui.dialog.clear();
+        },
+      },
+      {
+        name: "multimodel.graph",
+        title: "Multi-model wire graph",
+        description: "View routes between fleet members in recent runs",
+        category: "Multi-model",
+        namespace: "palette",
+        slashName: "graph",
+        run() {
+          api.route.navigate(ROUTE_GRAPH, { returnRoute: api.route.current });
+          api.ui.dialog.clear();
+        },
+      },
     ],
   });
 
-  api.lifecycle.onDispose(() => runner.close());
+  api.lifecycle.onDispose(async () => {
+    await runs.dispose();
+    await runner.close();
+    await store.close();
+  });
 };
 
 function FleetScreen(props: ScreenProps) {
@@ -233,7 +320,7 @@ function WorkflowsScreen(props: ScreenProps) {
               <For each={value().workflows}>
                 {(workflow) => (
                   <text fg={props.api.theme.current.text}>
-                    {workflow.name} · {workflow.steps.length} steps ·{" "}
+                    {workflow.name} · {workflowSummary(workflow)} ·{" "}
                     {workflow.description ?? "No description"}
                   </text>
                 )}
@@ -246,7 +333,7 @@ function WorkflowsScreen(props: ScreenProps) {
                 <text fg={props.api.theme.current.textMuted}>No runs yet.</text>
               }
             >
-              <For each={value().runs.slice(-20).reverse()}>
+              <For each={value().runs.slice(0, 20)}>
                 {(run) => (
                   <text
                     fg={
@@ -276,7 +363,7 @@ function WorkflowsScreen(props: ScreenProps) {
 
 function CollabScreen(
   props: ScreenProps & {
-    runner: OpenCodeAgentRunner;
+    runs: RunService;
     options: MultiModelOptions;
   },
 ) {
@@ -285,16 +372,15 @@ function CollabScreen(
     {},
   );
   const [output] = createResource(async () => {
-    const state = await props.store.read();
     const mode = isMode(props.params?.mode)
       ? props.params.mode
       : props.options.defaultMode;
     const sessionID = stringParam(props.params?.sessionID, "sessionID");
     const prompt = stringParam(props.params?.prompt, "prompt");
-    return collaborate(props.runner, state.fleet, sessionID, prompt, {
+    return props.runs.startCollaboration({
+      sessionID,
+      prompt,
       mode,
-      maxWorkers: props.options.maxWorkers,
-      maxParallel: props.options.maxParallel,
       signal: controller.signal,
       onActivity(event) {
         setActivity((current) => ({ ...current, [event.memberID]: event }));
@@ -331,10 +417,10 @@ function CollabScreen(
           {(value) => (
             <box flexDirection="column" gap={1}>
               <text fg={props.api.theme.current.success}>
-                Done · lead={value().leadID} · {value().participants.join(", ")}
+                {value().status} · run={value().id}
               </text>
               <text fg={props.api.theme.current.text} wrapMode="word">
-                {value().final.text}
+                {value().final ?? value().error ?? "No output."}
               </text>
             </box>
           )}
@@ -344,7 +430,7 @@ function CollabScreen(
   );
 }
 
-function WorkflowScreen(props: ScreenProps & { runner: OpenCodeAgentRunner }) {
+function WorkflowScreen(props: ScreenProps & { runs: RunService }) {
   const controller = new AbortController();
   const [snapshot, setSnapshot] = createSignal<string>("Starting…");
   const [output] = createResource(async () => {
@@ -354,22 +440,22 @@ function WorkflowScreen(props: ScreenProps & { runner: OpenCodeAgentRunner }) {
       (workflow) => workflow.name === name,
     );
     if (!definition) throw new Error(`Workflow ${name} does not exist.`);
-    return runWorkflow(
-      props.runner,
-      state.fleet,
-      stringParam(props.params?.sessionID, "sessionID"),
+    if (definition.kind === "script") {
+      throw new Error(
+        "Run script workflows through the native /workflow command so OpenCode can request source-hash permission.",
+      );
+    }
+    return props.runs.startWorkflow({
+      sessionID: stringParam(props.params?.sessionID, "sessionID"),
       definition,
-      typeof props.params?.input === "string" ? props.params.input : "",
-      {
-        signal: controller.signal,
-        async onUpdate(run) {
-          setSnapshot(
-            `${run.status} · ${run.steps.filter((step) => step.status === "completed").length}/${run.steps.length} steps`,
-          );
-          await props.store.saveRun(run);
-        },
-      },
-    );
+      input: typeof props.params?.input === "string" ? props.params.input : "",
+      signal: controller.signal,
+    }).then((run) => {
+      setSnapshot(
+        `${run.status} · ${run.steps.filter((step) => step.status === "completed").length}/${run.steps.length} steps`,
+      );
+      return run;
+    });
   });
   onCleanup(() => controller.abort());
   useBackKey(props.api, props.params);
@@ -411,6 +497,665 @@ function WorkflowScreen(props: ScreenProps & { runner: OpenCodeAgentRunner }) {
       </box>
     </Screen>
   );
+}
+
+function RunLedgerScreen(props: ScreenProps) {
+  const state = usePollingState(props.store);
+  useBackKey(props.api, props.params);
+  return (
+    <Screen api={props.api} title="Multi-model run ledger" params={props.params}>
+      <Show
+        when={state()}
+        fallback={<text fg={props.api.theme.current.textMuted}>Loading ledger…</text>}
+      >
+        {(value) => (
+          <box flexDirection="column" gap={1}>
+            <Show
+              when={value().runs.length > 0}
+              fallback={<text fg={props.api.theme.current.textMuted}>No runs yet.</text>}
+            >
+              <For each={value().runs.slice(0, 40)}>
+                {(run) => (
+                  <box
+                    flexDirection="row"
+                    gap={1}
+                    onMouseUp={() => props.api.route.navigate(ROUTE_RUN, {
+                      runID: run.id,
+                      returnRoute: props.api.route.current,
+                    })}
+                  >
+                    <text fg={runColor(props.api, run.status)}>{run.status}</text>
+                    <text fg={props.api.theme.current.text}>{run.definition}</text>
+                    <text fg={props.api.theme.current.textMuted}>{run.kind}</text>
+                    <text fg={props.api.theme.current.info}>{run.id}</text>
+                  </box>
+                )}
+              </For>
+            </Show>
+            <text fg={props.api.theme.current.textMuted}>
+              Active dashboards refresh every 500 ms; idle dashboards every 2 s.
+            </text>
+          </box>
+        )}
+      </Show>
+    </Screen>
+  );
+}
+
+function RunDetailScreen(props: ScreenProps) {
+  const state = usePollingState(props.store);
+  const runID = stringParam(props.params?.runID, "runID");
+  useBackKey(props.api, props.params);
+  return (
+    <Screen api={props.api} title={`Run · ${runID}`} params={props.params}>
+      <Show
+        when={state()?.runs.find((run) => run.id === runID)}
+        fallback={<text fg={props.api.theme.current.textMuted}>Loading run…</text>}
+      >
+        {(run) => (
+          <box flexDirection="column" gap={1}>
+            <text fg={runColor(props.api, run().status)}>
+              {run().definition} · {run().status} · {run().kind}
+            </text>
+            <For each={run().steps}>
+              {(step) => (
+                <text fg={runColor(props.api, step.status)}>
+                  {step.id} · {step.memberID} · {step.status}
+                  {step.error ? ` · ${step.error}` : ""}
+                </text>
+              )}
+            </For>
+            <Show when={run().final ?? run().error}>
+              <text fg={props.api.theme.current.text} wrapMode="word">
+                {run().final ?? run().error}
+              </text>
+            </Show>
+            <text fg={props.api.theme.current.accent}>Ledger events</text>
+            <For each={state()?.events.filter((event) => event.runID === runID).slice(-20)}>
+              {(event) => (
+                <text fg={props.api.theme.current.textMuted}>
+                  {event.id} · {event.type}
+                </text>
+              )}
+            </For>
+          </box>
+        )}
+      </Show>
+    </Screen>
+  );
+}
+
+function GraphScreen(props: ScreenProps) {
+  const state = usePollingState(props.store);
+  useBackKey(props.api, props.params);
+  return (
+    <Screen api={props.api} title="Multi-model wire graph" params={props.params}>
+      <Show
+        when={state()}
+        fallback={<text fg={props.api.theme.current.textMuted}>Loading graph…</text>}
+      >
+        {(value) => (
+          <box flexDirection="column" gap={1}>
+            <text fg={props.api.theme.current.accent}>
+              Fleet · lead={value().fleet.leadID}
+            </text>
+            <For each={value().fleet.members}>
+              {(member) => (
+                <text fg={props.api.theme.current.text}>
+                  {member.id === value().fleet.leadID
+                    ? `human → ${member.id} → human`
+                    : `${member.id} → ${value().fleet.leadID}`}
+                  {` · ${member.model.providerID}/${member.model.modelID}`}
+                </text>
+              )}
+            </For>
+            <text fg={props.api.theme.current.accent}>Recent routes</text>
+            <For each={value().runs.slice(0, 10)}>
+              {(run) => (
+                <text fg={runColor(props.api, run.status)}>
+                  {run.id} · {run.steps.map((step) => step.memberID).join(" → ") || run.definition}
+                </text>
+              )}
+            </For>
+          </box>
+        )}
+      </Show>
+    </Screen>
+  );
+}
+
+type ComposerSelection = {
+  mode: ComposerMode;
+  collaborationMode: CollabMode;
+  workflowName?: string;
+};
+
+type ComposerController = {
+  selection: () => ComposerSelection;
+  setSelection: (value: ComposerSelection) => void;
+  ref: (current: TuiRouteCurrent) => TuiPromptRef | undefined;
+  addRef: (sessionID: string, value: TuiPromptRef) => void;
+  removeRef: (sessionID: string, value: TuiPromptRef) => void;
+  sessionID: () => string;
+  setSessionID: (value: string) => void;
+  workflows: () => WorkflowDefinition[];
+  setWorkflows: (value: WorkflowDefinition[]) => void;
+};
+
+function createComposerController(
+  options: MultiModelOptions,
+  initialWorkflows: WorkflowDefinition[],
+): ComposerController {
+  const [selection, setSelection] = createSignal<ComposerSelection>({
+    mode: options.composer.initial,
+    collaborationMode: options.defaultMode,
+  });
+  const refs = new Map<string, Set<TuiPromptRef>>();
+  const [sessionID, setSessionID] = createSignal("__home__");
+  const [workflows, setWorkflows] = createSignal(initialWorkflows);
+  return {
+    selection,
+    setSelection,
+    ref(current) {
+      const currentSessionID = current.name === "home"
+        ? "__home__"
+        : current.name === "session" &&
+            typeof current.params?.sessionID === "string"
+          ? current.params.sessionID
+          : undefined;
+      if (!currentSessionID) return undefined;
+      const candidates = [...(refs.get(currentSessionID) ?? [])];
+      return candidates.find((candidate) => candidate.focused) ??
+        candidates.at(-1);
+    },
+    addRef(currentSessionID, value) {
+      const candidates = refs.get(currentSessionID) ?? new Set<TuiPromptRef>();
+      candidates.add(value);
+      refs.set(currentSessionID, candidates);
+    },
+    removeRef(currentSessionID, value) {
+      const candidates = refs.get(currentSessionID);
+      candidates?.delete(value);
+      if (candidates?.size === 0) refs.delete(currentSessionID);
+    },
+    sessionID,
+    setSessionID,
+    workflows,
+    setWorkflows,
+  };
+}
+
+function registerComposerInputRouting(
+  api: TuiPluginApi,
+  options: MultiModelOptions,
+  controller: ComposerController,
+) {
+  const route = () => {
+    const active = controller.ref(api.route.current);
+    if (!active?.focused) return false;
+    const routed = routeComposerPrompt(
+      active.current,
+      controller.selection(),
+      options.composer.autoRoute,
+      controller.workflows(),
+      options.defaultMode,
+    );
+    if (routed !== active.current) active.set(routed);
+    return active;
+  };
+  api.lifecycle.onDispose(api.keymap.intercept("key", (context) => {
+    if (!isPlainComposerSubmitKey(context.event)) return;
+    const active = route();
+    if (!active) return;
+    context.consume();
+    active.submit();
+  }, { priority: 10_000 }));
+  api.lifecycle.onDispose(api.keymap.registerLayer({
+    priority: 10_000,
+    commands: [{
+      name: "prompt.submit",
+      title: "Submit prompt through multi-model composer",
+      hidden: true,
+      run() {
+        const active = route();
+        if (!active) return false;
+        active.submit();
+        return true;
+      },
+    }],
+  }));
+}
+
+export function isPlainComposerSubmitKey(event: {
+  name: string;
+  ctrl?: boolean;
+  meta?: boolean;
+  shift?: boolean;
+  option?: boolean;
+}) {
+  return (event.name === "return" || event.name === "enter") &&
+    !event.ctrl && !event.meta && !event.shift && !event.option;
+}
+
+function registerComposerSlots(
+  api: TuiPluginApi,
+  store: StateStore,
+  options: MultiModelOptions,
+  controller: ComposerController,
+) {
+  api.slots.register({
+    slots: {
+      home_prompt(_context, props) {
+        return (
+          <NativeComposer
+            api={api}
+            store={store}
+            options={options}
+            controller={controller}
+            sessionID="__home__"
+            hostRef={props.ref}
+            rightSlot="home_prompt_right"
+          />
+        );
+      },
+      session_prompt(_context, props) {
+        return (
+          <NativeComposer
+            api={api}
+            store={store}
+            options={options}
+            controller={controller}
+            sessionID={props.session_id}
+            visible={props.visible}
+            disabled={props.disabled}
+            onSubmit={props.on_submit}
+            hostRef={props.ref}
+            rightSlot="session_prompt_right"
+          />
+        );
+      },
+      sidebar_content(_context, props) {
+        return (
+          <SidebarStatus api={api} store={store} sessionID={props.session_id} />
+        );
+      },
+      sidebar_footer() {
+        return (
+          <box paddingLeft={1} paddingRight={1}>
+            <text fg={api.theme.current.textMuted}>/runs · /graph · /workflows</text>
+          </box>
+        );
+      },
+    },
+  });
+}
+
+function NativeComposer(props: {
+  api: TuiPluginApi;
+  store: StateStore;
+  options: MultiModelOptions;
+  controller: ComposerController;
+  sessionID: string;
+  visible?: boolean;
+  disabled?: boolean;
+  onSubmit?: () => void;
+  hostRef?: (ref: TuiPromptRef | undefined) => void;
+  rightSlot: "home_prompt_right" | "session_prompt_right";
+}) {
+  const Prompt = props.api.ui.Prompt;
+  const Slot = props.api.ui.Slot;
+  let ref: TuiPromptRef | undefined;
+  createEffect(() => {
+    if (!composerSlotIsActive(
+      props.api.route.current,
+      props.sessionID,
+      props.visible,
+    )) {
+      return;
+    }
+    props.controller.setSessionID(props.sessionID);
+    void props.store.getSessionMode(props.sessionID).then((stored) => {
+      if (props.controller.sessionID() !== props.sessionID) return;
+      if (!stored) {
+        const selection = props.controller.selection();
+        void props.store.setSessionMode(
+          props.sessionID,
+          selection.mode,
+          selection.mode === "team"
+            ? selection.collaborationMode
+            : selection.workflowName,
+        );
+        return;
+      }
+      props.controller.setSelection({
+        mode: stored.mode,
+        collaborationMode: isMode(stored.collaboration_mode)
+          ? stored.collaboration_mode
+          : props.options.defaultMode,
+        workflowName: stored.workflow_name ?? undefined,
+      });
+    });
+  });
+  onCleanup(() => {
+    if (ref) props.controller.removeRef(props.sessionID, ref);
+    props.hostRef?.(undefined);
+  });
+  return (
+    <Prompt
+      sessionID={props.sessionID === "__home__" ? undefined : props.sessionID}
+      visible={props.visible}
+      disabled={props.disabled}
+      onSubmit={props.onSubmit}
+      ref={(value) => {
+        if (ref) props.controller.removeRef(props.sessionID, ref);
+        ref = value;
+        if (value) props.controller.addRef(props.sessionID, value);
+        if (!composerSlotIsActive(
+          props.api.route.current,
+          props.sessionID,
+          props.visible,
+        )) return;
+        props.controller.setSessionID(props.sessionID);
+        props.hostRef?.(value);
+      }}
+      right={
+        <box flexDirection="row" gap={1}>
+          {props.rightSlot === "session_prompt_right"
+            ? <Slot name="session_prompt_right" session_id={props.sessionID} />
+            : <Slot name="home_prompt_right" />}
+          <ModeBadge api={props.api} controller={props.controller} />
+        </box>
+      }
+    />
+  );
+}
+
+export function composerSlotIsActive(
+  current: TuiRouteCurrent,
+  sessionID: string,
+  visible?: boolean,
+) {
+  if (visible === false) return false;
+  if (sessionID === "__home__") return current.name === "home";
+  return current.name === "session" && current.params?.sessionID === sessionID;
+}
+
+function ModeBadge(props: {
+  api: TuiPluginApi;
+  controller: ComposerController;
+}) {
+  return (
+    <box
+      paddingLeft={1}
+      paddingRight={1}
+      backgroundColor={props.api.theme.current.backgroundElement}
+      onMouseUp={() => props.api.keymap.dispatchCommand("multimodel.mode")}
+    >
+      <text fg={props.api.theme.current.accent}>
+        {props.controller.selection().mode.toUpperCase()}
+      </text>
+    </box>
+  );
+}
+
+async function chooseComposerMode(
+  api: TuiPluginApi,
+  store: StateStore,
+  options: MultiModelOptions,
+  controller: ComposerController,
+) {
+  const DialogSelect = api.ui.DialogSelect;
+  api.ui.dialog.replace(() => (
+    <DialogSelect
+      title="Composer mode"
+      current={controller.selection().mode}
+      options={[
+        {
+          title: "SINGLE",
+          value: "single" as const,
+          description: "Submit through OpenCode's native single-model path",
+          onSelect() {
+            void saveComposerSelection(store, controller, {
+              ...controller.selection(),
+              mode: "single",
+            });
+            api.ui.dialog.clear();
+          },
+        },
+        {
+          title: "TEAM",
+          value: "team" as const,
+          description: "Rewrite normal prompts to /collab",
+          onSelect() {
+            api.ui.dialog.replace(() => (
+              <DialogSelect
+                title="Team collaboration mode"
+                current={controller.selection().collaborationMode}
+                options={COLLAB_MODES.map((mode) => ({
+                  title: mode,
+                  value: mode,
+                  description: modeDescription(mode),
+                  onSelect() {
+                    void saveComposerSelection(store, controller, {
+                      mode: "team",
+                      collaborationMode: mode,
+                    });
+                    api.ui.dialog.clear();
+                  },
+                }))}
+              />
+            ));
+          },
+        },
+        {
+          title: "WORKFLOW",
+          value: "workflow" as const,
+          description: "Rewrite normal prompts to a selected /workflow",
+          async onSelect() {
+            const workflows = (await store.read()).workflows;
+            if (workflows.length === 0) {
+              toast(api, "No workflows saved.", "warning");
+              return;
+            }
+            api.ui.dialog.replace(() => (
+              <DialogSelect
+                title="Workflow"
+                options={workflows.map((workflow) => ({
+                  title: workflow.name,
+                  value: workflow.name,
+                  description: workflowSummary(workflow),
+                  onSelect() {
+                    void saveComposerSelection(store, controller, {
+                      mode: "workflow",
+                      collaborationMode: options.defaultMode,
+                      workflowName: workflow.name,
+                    });
+                    api.ui.dialog.clear();
+                  },
+                }))}
+              />
+            ));
+          },
+        },
+      ]}
+    />
+  ));
+}
+
+async function saveComposerSelection(
+  store: StateStore,
+  controller: ComposerController,
+  selection: ComposerSelection,
+) {
+  controller.setSelection(selection);
+  await store.setSessionMode(
+    controller.sessionID(),
+    selection.mode,
+    selection.mode === "team"
+      ? selection.collaborationMode
+      : selection.workflowName,
+  );
+}
+
+export function routeComposerPrompt(
+  prompt: TuiPromptInfo,
+  selection: ComposerSelection,
+  autoRoute: boolean,
+  workflows: WorkflowDefinition[],
+  defaultMode: CollabMode,
+): TuiPromptInfo {
+  const input = prompt.input.trim();
+  if (
+    !input ||
+    prompt.mode === "shell" ||
+    input.startsWith("/") ||
+    input.startsWith("@")
+  ) return prompt;
+  const automatic = autoRoute ? automaticRoute(input, workflows) : undefined;
+  const mode = automatic?.mode ?? selection.mode;
+  if (mode === "single") return prompt;
+  if (mode === "team") {
+    return {
+      ...prompt,
+      input: `/collab ${automatic?.collaborationMode ?? selection.collaborationMode ?? defaultMode} ${prompt.input}`,
+    };
+  }
+  const workflowName = automatic?.workflowName ?? selection.workflowName;
+  if (!workflowName) return prompt;
+  return { ...prompt, input: `/workflow ${workflowName} ${prompt.input}` };
+}
+
+function automaticRoute(input: string, workflows: WorkflowDefinition[]) {
+  const workflow = workflows.find((definition) => {
+    const name = escapeRegExp(definition.name);
+    return new RegExp(`(?:^|\\s)workflow(?::|\\s+)${name}(?=\\s|$)`, "i").test(input);
+  });
+  if (workflow) {
+    return { mode: "workflow" as const, workflowName: workflow.name };
+  }
+  if (
+    /\b(multi[- ]model|multiple models|team|council|jury|panel|collaborat(?:e|ion))\b/i.test(input)
+  ) {
+    return { mode: "team" as const, collaborationMode: "council" as const };
+  }
+  return undefined;
+}
+
+function watchBackgroundRuns(
+  api: TuiPluginApi,
+  store: StateStore,
+  composer: ComposerController,
+) {
+  const seen = new Map<string, string>();
+  const watchingSince = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  const poll = async () => {
+    if (disposed || api.lifecycle.signal.aborted) return;
+    const state = await store.read();
+    composer.setWorkflows(state.workflows);
+    const runs = state.runs.filter((run) => run.background);
+    await Promise.all(runs.map(async (run) => {
+      const previous = seen.get(run.id);
+      seen.set(run.id, run.status);
+      const newlyCompleted = !previous && run.createdAt >= watchingSince &&
+        !isActiveStatus(run.status);
+      const transitioned = !!previous && isActiveStatus(previous) &&
+        !isActiveStatus(run.status);
+      if (!newlyCompleted && !transitioned) return;
+      await api.attention.notify({
+        title: "Multi-model run complete",
+        message: `${run.definition} · ${run.status}`,
+        sound: { name: run.status === "completed" ? "done" : "error" },
+        notification: true,
+      });
+    }));
+    if (disposed || api.lifecycle.signal.aborted) return;
+    timer = setTimeout(
+      () => void poll(),
+      runs.some((run) => isActiveStatus(run.status)) ? 500 : 2_000,
+    );
+  };
+  void poll();
+  api.lifecycle.onDispose(() => {
+    disposed = true;
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function usePollingState(store: StateStore) {
+  const [state, setState] = createSignal<Awaited<ReturnType<StateStore["read"]>>>();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  onMount(() => {
+    const poll = async () => {
+      const next = await store.read();
+      if (disposed) return;
+      setState(next);
+      timer = setTimeout(
+        () => void poll(),
+        next.runs.some((run) => isActiveStatus(run.status)) ? 500 : 2_000,
+      );
+    };
+    void poll();
+  });
+  onCleanup(() => {
+    disposed = true;
+    if (timer) clearTimeout(timer);
+  });
+  return state;
+}
+
+function SidebarStatus(props: {
+  api: TuiPluginApi;
+  store: StateStore;
+  sessionID: string;
+}) {
+  const state = usePollingState(props.store);
+  return (
+    <Show when={state()}>
+      {(value) => (
+        <box flexDirection="column" paddingLeft={1} paddingRight={1} gap={1}>
+          <text fg={props.api.theme.current.accent}>MULTI-MODEL</text>
+          <text fg={props.api.theme.current.textMuted}>
+            lead={value().fleet.leadID} · fleet={value().fleet.members.filter((member) => member.enabled).length}
+          </text>
+          <For each={value().runs.filter((run) =>
+            run.sessionID === props.sessionID && isActiveStatus(run.status)
+          )}>
+            {(run) => (
+              <text fg={props.api.theme.current.info}>
+                {run.definition} · {run.status}
+              </text>
+            )}
+          </For>
+        </box>
+      )}
+    </Show>
+  );
+}
+
+function isActiveStatus(status: string) {
+  return status === "pending" || status === "running" || status === "paused";
+}
+
+function runColor(api: TuiPluginApi, status: string) {
+  if (status === "completed") return api.theme.current.success;
+  if (status === "failed" || status === "cancelled" || status === "stopped") {
+    return api.theme.current.error;
+  }
+  if (status === "running") return api.theme.current.info;
+  return api.theme.current.warning;
+}
+
+function workflowSummary(workflow: WorkflowDefinition) {
+  return workflow.kind === "script"
+    ? "confined script"
+    : `${workflow.steps.length} DAG steps`;
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 type ScreenProps = {
@@ -509,7 +1254,11 @@ async function selectCollaboration(
   ));
 }
 
-async function selectWorkflow(api: TuiPluginApi, store: StateStore) {
+async function selectWorkflow(
+  api: TuiPluginApi,
+  store: StateStore,
+  composer: ComposerController,
+) {
   const state = await store.read();
   if (state.workflows.length === 0)
     return toast(api, "No workflows saved.", "warning");
@@ -521,8 +1270,26 @@ async function selectWorkflow(api: TuiPluginApi, store: StateStore) {
       options={state.workflows.map((definition) => ({
         title: definition.name,
         value: definition.name,
-        description: `${definition.steps.length} steps · ${definition.description ?? "No description"}`,
+        description: `${workflowSummary(definition)} · ${definition.description ?? "No description"}`,
         onSelect() {
+          if (definition.kind === "script") {
+            const prompt = composer.ref(api.route.current);
+            if (!prompt) {
+              toast(
+                api,
+                `Use /workflow ${definition.name} from the native composer to approve this script.`,
+                "warning",
+              );
+              return;
+            }
+            prompt.set({
+              ...prompt.current,
+              input: `/workflow ${definition.name} `,
+            });
+            prompt.focus();
+            api.ui.dialog.clear();
+            return;
+          }
           askForInput(
             api,
             `${definition.name} input`,

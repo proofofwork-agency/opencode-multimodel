@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "codex-delegator",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.0",
   "description": "A reusable Bun library for delegating work to a local OpenAI Codex CLI",
   "type": "module",
   "license": "MIT",

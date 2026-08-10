@@ -22,6 +22,8 @@ import {
 } from "codex-delegator";
 import { createCodexDelegatePlugin } from "../src/plugin.ts";
 import { createCodexDelegateProvider } from "../src/provider.ts";
+import serverModule from "../src/server.ts";
+import tuiModule from "../src/tui.ts";
 
 class FakeDelegate {
   readonly creates: CreateInput[] = [];
@@ -153,6 +155,15 @@ class FakeDelegate {
 }
 
 describe("OpenCode Codex delegate plugin", () => {
+  test("publishes separate OpenCode server and TUI modules", () => {
+    expect(serverModule.id).toBe("opencode-codex-delegate");
+    expect(typeof serverModule.server).toBe("function");
+    expect("tui" in serverModule).toBe(false);
+    expect(tuiModule.id).toBe("opencode-codex-delegate");
+    expect(typeof tuiModule.tui).toBe("function");
+    expect("server" in tuiModule).toBe(false);
+  });
+
   test("keeps the main entrypoint limited to one deduplicated plugin function", async () => {
     const entrypoint = await import("../src/index.ts");
     expect(

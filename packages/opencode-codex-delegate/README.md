@@ -2,6 +2,10 @@
 
 An OpenCode plugin that registers the locally authenticated OpenAI Codex CLI as a selectable provider and also exposes bounded delegation and native-review tools. It is a host adapter over [`codex-delegator`](../codex-delegator).
 
+Current prerelease: **`0.2.0-alpha.0`**, validated with OpenCode **1.18.15**.
+The package retains separate `./server` and `./tui` exports so OpenCode can load
+both plugin surfaces through one installation.
+
 ## Install
 
 Install the alpha channel by adding the tagged package to `opencode.json`:
@@ -108,3 +112,12 @@ OpenCode calls the plugin's `dispose` hook on shutdown, and the shared tool/prov
 ## Provider package entrypoint
 
 The package exports `opencode-codex-delegate/provider` for hosts that want to configure the AI SDK provider manually. Normal OpenCode use should load the plugin: its config hook points OpenCode at the bundled provider entrypoint and supplies lifecycle-managed runtime state automatically.
+
+## Alpha validation
+
+The `0.2.0-alpha.0` release gate covers the server/TUI module shapes, provider
+registration and streaming, idempotent retry behavior, approval bridging,
+managed-worktree restart/resume, review, steering, cancellation, concurrency,
+and a real combined OpenCode TEAM run. Provider-mode Codex owns its worktree;
+`opencode-multimodel` intentionally does not wrap it in another OpenCode
+workspace.

@@ -45,6 +45,7 @@ export async function collaborate(
     lead,
     workers,
     budget,
+    nextCall: 0,
     replies: [] as AgentReply[],
     log: [] as string[],
   };
@@ -89,6 +90,7 @@ type CollaborationContext = {
   lead: FleetMember;
   workers: FleetMember[];
   budget: AgentBudget;
+  nextCall: number;
   replies: AgentReply[];
   log: string[];
 };
@@ -105,7 +107,7 @@ async function leadOnly(
     "lead answer",
   );
   context.log.push(`human → lead:${context.lead.id} → human`);
-  return result(context, mode, final);
+  return result(context, mode, final, [context.lead]);
 }
 
 async function pair(
@@ -334,12 +336,15 @@ async function invoke(
   context.budget.spend(`${member.id}/${phase}`);
   activity(context, member, phase, detail);
   try {
+    const callIndex = context.nextCall++;
     const reply = await context.runner.run({
       parentSessionID: context.parentSessionID,
       member,
       prompt,
       system: collaborationSystem(member, context.lead, context.participants),
       signal: context.options.signal,
+      runID: context.options.runID,
+      callIndex,
     });
     context.replies.push(reply);
     activity(context, member, "done", detail);

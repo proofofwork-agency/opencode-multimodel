@@ -2,6 +2,10 @@
 
 `codex-delegator` is a reusable Bun library for running bounded tasks through a locally installed and authenticated OpenAI Codex CLI. It prefers one persistent `codex app-server` process per delegate seat and falls back to `codex exec --json` when app-server is unavailable.
 
+Current prerelease: **`0.2.0-alpha.0`**. This is the reusable runtime library,
+not an OpenCode plugin; install `opencode-codex-delegate@alpha` when OpenCode
+plugin/provider integration is required.
+
 ## Install
 
 ```sh
@@ -60,3 +64,8 @@ await delegate.closeAll();
 `CodexDelegator` accepts `executable`, `stateDir`, `serviceName`, and `appServerArgv` overrides. `TurnInput.reasoningEffort` maps to app-server's per-turn `effort` override. The remaining constructor hooks are intended for alternate transports and deterministic testing.
 
 Set `CODEX_DELEGATOR_LIVE=1` to enable read-only live tests. Write, review, and scale live tests have separate opt-in flags in `tests/live.test.ts`.
+
+The `0.2.0-alpha.0` gate was exercised with the locally authenticated Codex CLI,
+including app-server probe, persistent delegation, restart/resume, native review,
+steering, cancellation, concurrency, and multiple seats. These live checks remain
+explicit opt-ins for downstream development environments.

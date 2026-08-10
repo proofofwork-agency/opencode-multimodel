@@ -2,6 +2,8 @@
 
 Multi-model fleets, collaboration modes, and declarative workflows for original [OpenCode](https://github.com/anomalyco/opencode).
 
+Current prerelease: **`0.2.0-alpha.0`**, validated with OpenCode **1.18.15**.
+
 This package has two surfaces:
 
 - `opencode-multimodel/core` is a reusable orchestration library with an injected `AgentRunner`.
@@ -14,9 +16,13 @@ The collaboration behavior is adapted from the tested Poly orchestration engine,
 - `/lead` selects the model that owns assignments, synthesis, and verdicts.
 - `/fleet` opens a dedicated fleet screen.
 - `/collab` runs `lead`, `pair`, `round`, `council`, `orchestrate`, `handoff`, `panel`, `deliberate`, or `jury` mode.
-- `/workflow` selects and runs a saved declarative DAG workflow.
-- `/workflows` opens workflow definitions and run history.
-- Server tools provide the same capabilities in non-TUI OpenCode sessions.
+- `/workflow` selects and runs a saved DAG or confined script workflow.
+- `/mode` and the clickable composer badge select `SINGLE`, `TEAM`, or
+  `WORKFLOW` without replacing OpenCode's native prompt implementation.
+- `/workflows`, `/runs`, and `/graph` expose definitions, the durable event
+  ledger, live run status, and fleet routing.
+- Server tools provide explicit fleet, collaboration, run-control, and
+  workflow capabilities in API/headless OpenCode sessions.
 
 Each fleet seat runs in its own child OpenCode session. Parallel modes therefore use multiple provider models at the same time, subject to the providers' own concurrency and rate limits.
 
@@ -30,9 +36,25 @@ Install the alpha channel from npm:
     [
       "opencode-multimodel@alpha",
       {
+        "databasePath": ".opencode/multimodel.sqlite",
         "defaultMode": "council",
+        "maxWorkers": 8,
         "maxParallel": 3,
-        "maxWorkers": 8
+        "composer": {
+          "enabled": true,
+          "initial": "single",
+          "autoRoute": false
+        },
+        "workflows": {
+          "scripts": false,
+          "directories": [".opencode/workflows"],
+          "timeoutMs": 300000,
+          "maxAgentCalls": 64
+        },
+        "retention": {
+          "runs": 100,
+          "events": 10000
+        }
       }
     ]
   ]
@@ -41,7 +63,17 @@ Install the alpha channel from npm:
 
 OpenCode loads the package's separate `./server` and `./tui` exports. The server entry registers tools and command templates; the TUI entry registers slash commands and additional screens.
 
-On first use, the plugin creates `.opencode/multimodel.json` and adds one default model from each connected provider. Use `/lead` to select the lead. Fleet state, workflow definitions, and the last 100 workflow runs are shared through that file.
+On first use, the plugin creates `.opencode/multimodel.sqlite` with SQLite WAL,
+a busy timeout, transactions, and file mode `0600`. It adds one default model
+from each connected provider. The database stores fleet configuration, composer
+modes, definitions, runs, steps, agent calls, child sessions, preserved
+workspaces, leases, and an append-only event ledger. It never stores provider
+credentials, tokens, or environment variables.
+
+An existing `.opencode/multimodel.json` is imported once and left untouched.
+The deprecated `statePath` option can point at another JSON import source.
+Unfinished expired runs become `interrupted`; resume is always explicit.
+Retention removes only older terminal runs, never active runs.
 
 You can provide an explicit fleet in plugin options:
 
@@ -62,17 +94,19 @@ You can provide an explicit fleet in plugin options:
                 "modelID": "claude-sonnet-4-5"
               },
               "agent": "plan",
-              "enabled": true
+              "enabled": true,
+              "isolation": "shared"
             },
             {
               "id": "codex",
               "role": "implementation specialist",
               "model": {
                 "providerID": "codex-delegate",
-                "modelID": "gpt-5.6-codex"
+                "modelID": "gpt-5.6-sol"
               },
               "agent": "plan",
-              "enabled": true
+              "enabled": true,
+              "isolation": "worktree"
             }
           ]
         }
@@ -84,7 +118,7 @@ You can provide an explicit fleet in plugin options:
 
 ## Codex delegate participation
 
-The multi-model plugin treats every seat as an ordinary OpenCode `{ providerID, modelID }` selection. A delegate can participate directly when its plugin exposes Codex as a real OpenCode provider, for example `codex-delegate/gpt-5.6-codex`.
+The multi-model plugin treats every seat as an ordinary OpenCode `{ providerID, modelID }` selection. A delegate can participate directly when its plugin exposes Codex as a real OpenCode provider, for example `codex-delegate/gpt-5.6-sol`.
 
 Authentication and billing remain the delegate provider's responsibility. If that provider uses the Codex CLI subscription session, child fleet calls use the same subscription path and share its rate limits. This plugin does not convert API-key billing into subscription usage or bypass provider limits.
 
@@ -103,16 +137,18 @@ A tool-only delegate cannot be selected as a fleet model. It must expose a provi
 | `panel` / `deliberate` | One structured ballot round; lead judges.                                               |
 | `jury`                 | Two structured ballot rounds with rebuttal; lead judges.                                |
 
-All modes enforce a model-call budget. Worker failures are preserved in council/orchestrate output so a healthy lead can still synthesize. Recursive multi-model tools are disabled inside child sessions.
+All modes enforce a model-call budget. Worker failures are preserved in council/orchestrate output so a healthy lead can still synthesize. Nested multi-model and Codex-delegate orchestration tools are disabled inside child sessions, while ordinary OpenCode implementation tools remain available. Runs may be foreground or background and can be inspected, steered, cancelled, or explicitly resumed through `multimodel_run`.
 
-## Declarative workflows
+## Workflows
 
-Workflows are JSON DAGs. They do not execute generated JavaScript.
+`kind: "dag"` workflows are safe JSON dependency graphs. The `kind` may be
+omitted for compatibility with definitions saved by `0.1.x`.
 
 Save a definition with the `multimodel_workflow` tool using `action: "save"` and JSON like:
 
 ```json
 {
+  "kind": "dag",
   "name": "implementation-review",
   "description": "Research and review in parallel, then merge",
   "maxParallel": 2,
@@ -138,6 +174,47 @@ Save a definition with the `multimodel_workflow` tool using `action: "save"` and
 ```
 
 Steps become runnable when all dependencies finish. Ready steps run with bounded concurrency. `${input}` and `${step-id}` placeholders are interpolated from the workflow input and prior step results. Cycles, duplicate IDs, missing dependencies, and more than 64 steps are rejected before execution.
+
+Experimental `kind: "script"` workflows are disabled by default. When
+`workflows.scripts` is enabled, source runs in the bundled tree-walking
+interpreter—not `eval`, `Function`, Node, or Bun. The accepted
+JavaScript/TypeScript-style expression surface contains only `args`, `agent`,
+`parallel`, `pipeline`, `phase`, and `log`:
+
+```json
+{
+  "kind": "script",
+  "name": "independent-review",
+  "source": "export default async ({ agent, parallel }) => parallel([agent({ prompt: 'Review security', memberID: 'claude' }), agent({ prompt: 'Review tests', memberID: 'codex' })])"
+}
+```
+
+Imports, filesystem/network access, `process`, `Bun`, host globals, dynamic
+evaluation, and prototype traversal are rejected. Source is limited to 500 kB,
+64 agent calls, six parallel calls, and a five-minute default timeout. OpenCode
+permission is bound to `<workflow>:<normalized-source-sha256>`, so editing source
+requires new permission. Resume reuses only the exact contiguous call prefix
+whose index, prompt, model/agent options, and isolation still match.
+
+Use `multimodel_workflow` to pause at a safe boundary, resume, stop active child
+sessions, or restart an agent step. Worktrees remain available for inspection
+until `multimodel_run` performs explicit `cleanup-workspaces`; the plugin never
+auto-merges them.
+
+## Native composer
+
+The TUI registers replace-slots for the home and session composers but renders
+OpenCode's own `api.ui.Prompt` inside them. `SINGLE` calls native submit without
+modification. `TEAM` rewrites ordinary input to `/collab <mode> …`, and
+`WORKFLOW` rewrites it to `/workflow <name> …`. Attachments remain on the native
+prompt object. Shell mode, existing slash commands, and leading `@` input are
+never rewritten.
+
+`composer.autoRoute` defaults to `false`. When enabled, explicit multi-model
+language selects TEAM and only an exact `workflow:<saved-name>` or
+`workflow <saved-name>` reference selects WORKFLOW. The visible badge remains a
+manual override. API/headless calls do not infer intent; use commands and tools
+explicitly.
 
 ## Reusable core
 
@@ -170,11 +247,20 @@ const result = await collaborate(
 
 ## Safety and current host limits
 
-- Parallel seats can share a project directory. Use OpenCode's read-only/plan agent for reviewers, and avoid assigning simultaneous write work to overlapping files.
+- Fleet members default to `isolation: "shared"`. `isolation: "worktree"` uses
+  OpenCode's experimental workspace API and fails closed if creation is
+  unavailable; it never silently falls back to the shared checkout.
+- `codex-delegate` retains its own worktree ownership, so the multimodel adapter
+  does not create a nested OpenCode worktree for that provider.
 - Server tool runs request OpenCode permission before starting multi-model calls.
-- TUI runs are explicit user actions from `/collab` or `/workflow`.
-- Original OpenCode does not expose a plugin hook that transparently replaces every prompt on the default session screen. Collaboration therefore runs through the plugin commands/tools and dedicated screens rather than silently intercepting normal prompts.
+- TUI mode routing is visible in the clickable composer badge and `/mode`.
 - The plugin does not patch OpenCode and does not require the Poly fork.
+
+OpenCode 1.18.15's established server/TUI plugin API remains the integration
+surface because it provides custom tools, replace-slots, routes, keymaps, and
+native Prompt access. The newer v2 client is used for explicit server/headless
+connections, but does not yet replace those host capabilities. The plugin keeps
+the two entrypoints separate so this can evolve without a package split.
 
 ## Development
 
@@ -185,4 +271,14 @@ bun run typecheck
 bun run build
 ```
 
-The test suite covers collaboration ordering and concurrency, jury voting, call budgets, task parsing, workflow DAG validation/runtime behavior, OpenCode child-session reuse, provider discovery, and separate server/TUI plugin module shapes.
+The test suite covers SQLite concurrency/migration/idempotency/recovery and
+retention, composer routing and bypasses, collaboration ordering and
+cancellation, DAG pause/resume, confined-script escapes/hash/timeout/budgets,
+child-session restart reuse, worktree fail-closed behavior and cleanup, provider
+discovery, and separate server/TUI module shapes.
+
+The `0.2.0-alpha.0` live gate additionally installs the delegate and multi-model
+plugins one at a time with OpenCode's installer, runs a real TEAM `pair` across
+OpenAI and Codex, verifies durable child-session and Codex-thread reuse after a
+process restart, and confirms that delegate isolation creates only the delegate's
+managed worktree rather than a nested OpenCode workspace.

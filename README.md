@@ -2,11 +2,15 @@
 
 This repository is the Proof of Work OpenCode monorepo. It contains three independent public packages:
 
+Current prerelease: **`0.2.0-alpha.0`** for all three packages. The alpha has
+been built and exercised against OpenCode **1.18.15**. Keep the npm `alpha`
+dist-tag explicit until the APIs graduate from prerelease.
+
 | Package | Purpose | Alpha install |
 | --- | --- | --- |
-| [`opencode-multimodel`](./packages/opencode-multimodel) | Multi-model fleets, collaboration modes, and declarative workflows for OpenCode. | `bun add opencode-multimodel@alpha` |
-| [`codex-delegator`](./packages/codex-delegator) | Reusable Bun library for driving a locally authenticated Codex CLI. | `bun add codex-delegator@alpha` |
-| [`opencode-codex-delegate`](./packages/opencode-codex-delegate) | OpenCode plugin and provider backed by `codex-delegator`. | `bun add opencode-codex-delegate@alpha` |
+| [`opencode-multimodel`](./packages/opencode-multimodel) | Durable TEAM/WORKFLOW fleets, collaboration modes, dashboards, and workflows for OpenCode. | `bun add opencode-multimodel@alpha` |
+| [`codex-delegator`](./packages/codex-delegator) | Reusable Bun library for driving a locally authenticated Codex CLI; this is the shared runtime, not an OpenCode plugin. | `bun add codex-delegator@alpha` |
+| [`opencode-codex-delegate`](./packages/opencode-codex-delegate) | OpenCode plugin, tools, and selectable AI SDK provider backed by `codex-delegator`. | `bun add opencode-codex-delegate@alpha` |
 
 All packages are configured to publish on npm under the `alpha` dist-tag. Once released, OpenCode plugin configuration should keep that tag explicit while the APIs are pre-release:
 
@@ -20,15 +24,27 @@ All packages are configured to publish on npm under the `alpha` dist-tag. Once r
 }
 ```
 
+OpenCode discovers separate `./server` and `./tui` entrypoints for both plugin
+packages. `opencode-codex-delegate` registers `codex-delegate/<model>` selections;
+`opencode-multimodel` can use those models as ordinary fleet seats without
+creating a second nested worktree.
+
 The Codex packages use the locally installed Codex CLI. Authentication remains owned by that CLI; this repository does not contain, copy, or publish Codex credentials.
+
+## Alpha validation
+
+The `0.2.0-alpha.0` release gate covers unit and integration tests, package
+typechecks and builds, npm tarball inspection, SQLite recovery/concurrency,
+composer routing, workflow sandbox boundaries, worktree fail-closed behavior,
+real Codex app-server delegation, and a combined OpenCode 1.18.15 TEAM run with
+child-session and Codex-thread reuse after restart. Live Codex tests remain
+opt-in because they consume an authenticated local account.
 
 ## Development
 
 ```sh
 bun install
-bun run typecheck
-bun run test
-bun run build
+bun run verify
 ```
 
 Run `bun run publish:alpha` only after the full verification succeeds and npm authentication is configured. The script publishes `codex-delegator` first so the dependent OpenCode plugin can resolve it.
