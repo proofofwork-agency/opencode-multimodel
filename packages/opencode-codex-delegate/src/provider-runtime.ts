@@ -3,6 +3,7 @@ import {
   DelegatorError,
   type CodexDelegatorOptions,
   type DelegateApprovalPolicy,
+  type CloseInput,
   type DelegateEvent,
   type DelegateHandle,
   type DelegateIsolation,
@@ -20,6 +21,7 @@ export type DelegateClient = Pick<
   | "steer"
   | "cancel"
   | "inspect"
+  | "usage"
   | "close"
   | "closeAll"
 >;
@@ -64,6 +66,7 @@ export class CodexProviderRuntime {
   private readonly delegate: DelegateClient;
   private readonly seats = new Map<string, ProviderSeat>();
   private readonly attaching = new Map<string, Promise<ProviderSeat>>();
+  private readonly closing = new Map<string, Promise<void>>();
 
   constructor(private readonly options: ProviderRuntimeOptions) {
     this.delegate =
@@ -71,7 +74,7 @@ export class CodexProviderRuntime {
       new CodexDelegator({
         executable: options.executable,
         stateDir: options.stateDir,
-        serviceName: "opencode-codex-delegate",
+        serviceName: "codex_opencode",
       } satisfies CodexDelegatorOptions);
   }
 
@@ -98,9 +101,59 @@ export class CodexProviderRuntime {
     return result;
   }
 
+  async resolveHandle(sessionID: string, seatId?: string) {
+    const matching = [...this.seats.entries()].filter(([key]) =>
+      key.startsWith(`${sessionID}\0`),
+    );
+    if (seatId) {
+      const byAgent = this.seats.get(`${sessionID}\0${seatId}`);
+      if (byAgent) return byAgent.handle;
+      const bySeat = matching.find(
+        ([, seat]) =>
+          seat.handle.seatId === seatId ||
+          seat.handle.seatId === `provider-${seatId}`,
+      );
+      if (bySeat) return bySeat[1].handle;
+    }
+    for (const [, seat] of matching) {
+      const snapshot = await this.delegate.inspect(seat.handle).catch(() => null);
+      if (
+        snapshot?.status === "running" ||
+        snapshot?.status === "awaiting-approval" ||
+        snapshot?.activeTurnId
+      )
+        return seat.handle;
+    }
+    return matching.length === 1 ? matching[0]![1].handle : null;
+  }
+
+  async closeHandle(
+    sessionID: string,
+    handle: DelegateHandle | string,
+    input: CloseInput,
+  ) {
+    const id = typeof handle === "string" ? handle : handle.id;
+    const matching = [...this.seats.entries()].filter(
+      ([key, seat]) =>
+        key.startsWith(`${sessionID}\0`) && seat.handle.id === id,
+    );
+    if (!matching.length) return false;
+    matching.forEach(([key]) => this.seats.delete(key));
+    const closing = this.delegate.close(handle, input);
+    matching.forEach(([key]) => this.closing.set(key, closing));
+    try {
+      await closing;
+    } finally {
+      matching.forEach(([key]) => {
+        if (this.closing.get(key) === closing) this.closing.delete(key);
+      });
+    }
+    return true;
+  }
+
   async closeSession(sessionID: string) {
     await Promise.allSettled(
-      [...this.attaching.entries()]
+      [...this.attaching.entries(), ...this.closing.entries()]
         .filter(([key]) => key.startsWith(`${sessionID}\0`))
         .map(([, pending]) => pending),
     );
@@ -109,12 +162,17 @@ export class CodexProviderRuntime {
     );
     matching.forEach(([key]) => this.seats.delete(key));
     await Promise.allSettled(
-      matching.map(([, seat]) => this.delegate.close(seat.handle)),
+      matching.map(([, seat]) =>
+        this.delegate.close(seat.handle, { cleanup: false }),
+      ),
     );
   }
 
   async dispose() {
-    await Promise.allSettled(this.attaching.values());
+    await Promise.allSettled([
+      ...this.attaching.values(),
+      ...this.closing.values(),
+    ]);
     const handles = [...this.seats.values()].map((seat) => seat.handle);
     this.seats.clear();
     this.attaching.clear();
@@ -136,6 +194,11 @@ export class CodexProviderRuntime {
     const pending = this.attaching.get(key);
     if (pending) {
       await pending;
+      return this.attach(input);
+    }
+    const closing = this.closing.get(key);
+    if (closing) {
+      await closing;
       return this.attach(input);
     }
     const current = this.seats.get(key);

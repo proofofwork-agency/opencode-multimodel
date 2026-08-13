@@ -65,6 +65,26 @@ class FakeTransport implements RpcTransport {
     if (method === "turn/steer")
       return { turnId: object(params).expectedTurnId };
     if (method === "turn/interrupt") return {};
+    if (method === "account/usage/read")
+      return {
+        summary: {
+          lifetimeTokens: 1_234_567,
+          peakDailyTokens: 45_678,
+          longestRunningTurnSec: 540,
+          currentStreakDays: 8,
+          longestStreakDays: 14,
+        },
+        dailyUsageBuckets: [{ startDate: "2026-06-18", tokens: 12_345 }],
+      };
+    if (method === "account/rateLimits/read")
+      return {
+        rateLimits: {
+          primary: { usedPercent: 40, resetsAt: 1_700_000_000 },
+          secondary: { usedPercent: 10, resetsAt: 1_700_001_000 },
+        },
+      };
+    if (method === "thread/unsubscribe") return { status: "unsubscribed" };
+    if (method === "thread/delete") return {};
     if (method !== "turn/start" && method !== "review/start") return {};
     const prompt =
       method === "review/start"
@@ -85,6 +105,22 @@ class FakeTransport implements RpcTransport {
     if (mode === "reject")
       throw new DelegatorError("TRANSPORT_ERROR", "HTTP 400 invalid request");
     const turnId = `turn-${++this.turn}`;
+    this.emit({
+      method: "turn/started",
+      params: {
+        threadId: "thread",
+        turn: { id: turnId, status: "inProgress" },
+      },
+    });
+    if (
+      method === "review/start" &&
+      JSON.stringify(params).includes("hang-review")
+    ) {
+      return {
+        turn: { id: turnId, status: "inProgress" },
+        reviewThreadId: "review-thread",
+      };
+    }
     if (prompt.includes("approval") && this.options.onServerRequest) {
       this.approvalResults.push(
         await this.options.onServerRequest({
@@ -101,13 +137,6 @@ class FakeTransport implements RpcTransport {
       );
     }
     setTimeout(() => {
-      this.emit({
-        method: "turn/started",
-        params: {
-          threadId: "thread",
-          turn: { id: turnId, status: "inProgress" },
-        },
-      });
       if (mode === "hang") return;
       if (mode === "ambiguous") {
         this.emit({
@@ -263,6 +292,10 @@ describe("Codex delegator", () => {
       status: "completed",
       output: "done",
       usage: { inputTokens: 4, outputTokens: 1 },
+      changes: {
+        files: ["README.md"],
+        summary: "1 changed file",
+      },
     });
     expect(fixture.transports[0]?.approvalResults).toEqual([
       { decision: "acceptForSession" },
@@ -271,12 +304,12 @@ describe("Codex delegator", () => {
       fixture.transports[0]?.requests.find(
         (request) => request.method === "thread/start",
       )?.params,
-    ).toMatchObject({ serviceName: "codex-delegator" });
+    ).toMatchObject({ serviceName: "codex_opencode" });
     expect(
       fixture.transports[0]?.requests.find(
         (request) => request.method === "turn/start",
       )?.params,
-    ).toMatchObject({ effort: "high" });
+    ).toMatchObject({ effort: "high", outputSchema: null });
     const sourceThread = (await fixture.delegate.inspect(handle)).threadId;
     const review = await fixture.delegate.review(handle, {
       target: { type: "uncommittedChanges" },
@@ -299,14 +332,77 @@ describe("Codex delegator", () => {
     );
 
     const hanging = fixture.delegate.turn(handle, "hang");
-    await Bun.sleep(10);
-    const activeTurnId = (await fixture.delegate.inspect(handle)).activeTurnId;
     expect(
       await fixture.delegate.steer(handle, "focus on tests"),
-    ).toMatchObject({ turnId: activeTurnId });
+    ).toMatchObject({ turnId: expect.any(String) });
+    const activeTurnId = (await fixture.delegate.inspect(handle)).activeTurnId;
+    expect(
+      fixture.transports[0]?.requests.find(
+        (request) => request.method === "turn/steer",
+      )?.params,
+    ).toMatchObject({
+      expectedTurnId: activeTurnId,
+      clientUserMessageId: expect.any(String),
+    });
     await fixture.delegate.cancel(handle);
     expect(await hanging).toMatchObject({ status: "cancelled" });
     expect((await fixture.delegate.inspect(handle)).status).toBe("idle");
+  });
+
+  test("steers while a turn is awaiting approval", async () => {
+    const fixture = await setup();
+    const handle = await fixture.delegate.create({
+      cwd: fixture.root,
+      approval: async () => {
+        expect(
+          await fixture.delegate.steer(handle, "continue after approval"),
+        ).toMatchObject({ turnId: expect.any(String) });
+        return "once";
+      },
+    });
+    expect(
+      await fixture.delegate.turn(handle, "approval please"),
+    ).toMatchObject({ status: "completed" });
+  });
+
+  test("rejects steering a native review turn without sending turn/steer", async () => {
+    const fixture = await setup();
+    const handle = await fixture.delegate.create({ cwd: fixture.root });
+    const reviewing = fixture.delegate.review(handle, {
+      target: { type: "custom", instructions: "hang-review" },
+    });
+    await expect(
+      fixture.delegate.steer(handle, "do not steer this review"),
+    ).rejects.toMatchObject({
+      code: "INVALID_REQUEST",
+      retryable: false,
+    });
+    expect(
+      fixture.transports[0]?.requests.some(
+        (request) => request.method === "turn/steer",
+      ),
+    ).toBe(false);
+    await fixture.delegate.cancel(handle);
+    expect((await reviewing).status).toBe("cancelled");
+  });
+
+  test("reads account usage without starting a turn", async () => {
+    const fixture = await setup();
+    const handle = await fixture.delegate.create({ cwd: fixture.root });
+    expect(await fixture.delegate.usage(handle)).toMatchObject({
+      lifetimeTokens: 1_234_567,
+      peakDailyTokens: 45_678,
+      dailyUsageBuckets: [{ startDate: "2026-06-18", tokens: 12_345 }],
+      primaryUsedPercent: 40,
+      secondaryUsedPercent: 10,
+    });
+    expect(
+      fixture.transports[0]?.requests.map((request) => request.method),
+    ).toEqual([
+      "thread/start",
+      "account/usage/read",
+      "account/rateLimits/read",
+    ]);
   });
 
   test("does not replay permanent errors or ambiguous accepted turns", async () => {
@@ -325,6 +421,11 @@ describe("Codex delegator", () => {
       error: { code: "AMBIGUOUS_DELIVERY" },
     });
     expect((await fixture.delegate.inspect(handle)).status).toBe("ambiguous");
+    await expect(
+      fixture.delegate.turn(handle, "another write"),
+    ).rejects.toMatchObject({
+      code: "AMBIGUOUS_DELIVERY",
+    });
   });
 
   test("surfaces rate limits and supports concurrent Codex seats", async () => {
@@ -383,6 +484,14 @@ describe("Codex delegator", () => {
       confirmedUnsafe: true,
     });
     expect((await fixture.delegate.inspect(handle)).isolation).toBe("current");
+    const readOnly = await fixture.delegate.create({
+      cwd: fixture.root,
+      isolation: "current",
+      mode: "read-only",
+    });
+    expect((await fixture.delegate.inspect(readOnly)).isolation).toBe(
+      "current",
+    );
   });
 
   test("keeps read-only sessions sandboxed even when bypass was explicitly confirmed", async () => {
@@ -444,6 +553,7 @@ describe("Codex delegator", () => {
       completedAt: 2,
       malformedEvents: 0,
       truncated: false,
+      changes: null,
       error: null,
     };
     const delegate = new CodexDelegator({
@@ -453,13 +563,15 @@ describe("Codex delegator", () => {
       },
       ensureWorktree: async () => ({ sourceRoot: root, worktree: root }),
       runCommand: async (input) =>
-        commandResult(
-          input.argv.includes("--help")
-            ? "--json"
-            : input.argv.includes("status")
-              ? "Logged in with ChatGPT"
-              : "codex-cli 0.146.0",
-        ),
+        input.argv[0] === "git"
+          ? commandResult("", 1)
+          : commandResult(
+              input.argv.includes("--help")
+                ? "--json"
+                : input.argv.includes("status")
+                  ? "Logged in with ChatGPT"
+                  : "codex-cli 0.146.0",
+            ),
       runExec: async () => result,
     });
     const handle = await delegate.create({ cwd: root });
@@ -489,13 +601,15 @@ describe("Codex delegator", () => {
       },
       ensureWorktree: async () => ({ sourceRoot: root, worktree: root }),
       runCommand: async (input) =>
-        commandResult(
-          input.argv.includes("--help")
-            ? "--json"
-            : input.argv.includes("status")
-              ? "Logged in with ChatGPT"
-              : "codex-cli 0.146.0",
-        ),
+        input.argv[0] === "git"
+          ? commandResult("", 1)
+          : commandResult(
+              input.argv.includes("--help")
+                ? "--json"
+                : input.argv.includes("status")
+                  ? "Logged in with ChatGPT"
+                  : "codex-cli 0.146.0",
+            ),
       runExec: async (input) => {
         started();
         return new Promise((resolve) =>
@@ -520,6 +634,7 @@ describe("Codex delegator", () => {
                 completedAt: 2,
                 malformedEvents: 0,
                 truncated: false,
+                changes: null,
                 error: null,
               }),
             { once: true },
@@ -548,16 +663,24 @@ async function setup() {
         return transport;
       },
       ensureWorktree: async () => ({ sourceRoot: root, worktree: root }),
-      runCommand: async () => commandResult("codex-cli 0.146.0"),
+      runCommand: async (input) => {
+        if (input.argv[0] !== "git") return commandResult("codex-cli 0.146.0");
+        if (input.argv.includes("rev-parse")) return commandResult(`${root}\n`);
+        if (input.argv.includes("status")) return commandResult(" M README.md\0");
+        if (input.argv.includes("ls-files")) return commandResult("");
+        if (input.argv.includes("diff"))
+          return commandResult("diff --git a/README.md\n+tracked edit\n");
+        return commandResult("");
+      },
     });
   return { root, transports, makeDelegate, delegate: makeDelegate() };
 }
 
-function commandResult(stdout: string) {
+function commandResult(stdout: string, exitCode = 0) {
   return {
     stdout,
     stderr: "",
-    exitCode: 0,
+    exitCode,
     signal: null,
     cancelled: false,
     timedOut: false,

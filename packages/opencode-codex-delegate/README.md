@@ -64,9 +64,11 @@ With the default `ask` policy, Codex can work inside its sandbox but provider-mo
 
 - `codex_delegate`: run a persistent delegate turn; defaults to write mode in a managed detached worktree.
 - `codex_review`: run native read-only review for uncommitted changes, a base branch, a commit, or custom instructions.
-- `codex_status`: inspect an attached seat.
+- `codex_status`: inspect an attached seat, including active turn kind and worktree.
 - `codex_steer`: steer the currently active turn.
 - `codex_cancel`: cancel the currently active turn.
+- `codex_usage`: read Codex account usage and rate-limit buckets without starting a turn.
+- `codex_close`: close a seat; cleanup (default true) drops the managed worktree and deletes the thread.
 - `codex_probe`: report CLI version, authentication, transport capabilities, and available models.
 
 OpenCode session IDs scope persisted seats, so the same seat name in two sessions does not share a Codex thread. App-server approval requests flow through OpenCode's `ask` permission API as `codex_command`, `codex_file`, or `codex_permissions`.

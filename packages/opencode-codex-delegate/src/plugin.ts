@@ -19,6 +19,7 @@ import {
   type DelegateProbe,
   type DelegateTurnResult,
   type DelegateModel,
+  type DelegateAccountUsage,
   type ReviewTarget,
 } from "codex-delegator";
 import {
@@ -37,6 +38,8 @@ type Seat = {
   configuration: string;
   handle: DelegateHandle;
 };
+
+const MAX_REPORTED_CHANGE_FILES = 100;
 
 export type CodexDelegatePluginOptions = PluginOptions & {
   executable?: string;
@@ -71,7 +74,7 @@ export function createCodexDelegatePlugin(
     )({
       executable: options.executable,
       stateDir: options.stateDir,
-      serviceName: "opencode-codex-delegate",
+      serviceName: "codex_opencode",
     });
     const seats = new Map<string, Seat>();
     const attaching = new Map<string, Promise<Seat>>();
@@ -167,7 +170,9 @@ export function createCodexDelegatePlugin(
         );
         matching.forEach(([key]) => seats.delete(key));
         await Promise.allSettled([
-          ...matching.map(([, seat]) => delegate.close(seat.handle)),
+          ...matching.map(([, seat]) =>
+            delegate.close(seat.handle, { cleanup: false }),
+          ),
           providerRuntime.closeSession(sessionID),
         ]);
       },
@@ -246,7 +251,7 @@ export function createCodexDelegatePlugin(
         }),
         codex_review: tool({
           description:
-            "Run Codex CLI's native read-only review against uncommitted changes, a base branch, a commit, or custom review instructions.",
+            "Run Codex CLI's native read-only review. Uncommitted reviews use the current checkout so Codex sees dirty files. Pass the writer seatId to review that seat's worktree without reopening it.",
           args: {
             scope: tool.schema
               .enum(["uncommitted", "base", "commit", "custom"])
@@ -293,15 +298,24 @@ export function createCodexDelegatePlugin(
               always: [seatId],
               metadata: { seatId, scope: args.scope ?? "uncommitted" },
             });
-            const seat = await attach(
-              {
-                ...args,
-                seatId,
-                mode: "read-only",
-                approvalPolicy: "ask",
-              },
-              context,
-            );
+            const existing = seats.get(seatKey(context.sessionID, seatId));
+            const seat =
+              existing ??
+              (await attach(
+                {
+                  ...args,
+                  seatId,
+                  mode: "read-only",
+                  approvalPolicy: "ask",
+                  isolation:
+                    args.isolation ??
+                    ((args.scope ?? "uncommitted") === "uncommitted" ||
+                    (args.scope ?? "uncommitted") === "custom"
+                      ? "current"
+                      : "worktree"),
+                },
+                context,
+              ));
             const result = requireCompleted(
               await delegate.review(seat.handle, {
                 target: reviewTarget(args.scope, args.value, args.title),
@@ -325,10 +339,15 @@ export function createCodexDelegatePlugin(
           },
           async execute(args, context) {
             const seatId = safeSeat(args.seatId);
-            const seat = seats.get(seatKey(context.sessionID, seatId));
-            if (!seat)
+            const handle = await resolveLiveHandle(
+              seats,
+              providerRuntime,
+              context.sessionID,
+              seatId,
+            ).catch(() => null);
+            if (!handle)
               return `Codex seat ${seatId} is not attached in this OpenCode process.`;
-            return inspectionOutput(await delegate.inspect(seat.handle));
+            return inspectionOutput(await delegate.inspect(handle));
           },
         }),
         codex_steer: tool({
@@ -352,10 +371,15 @@ export function createCodexDelegatePlugin(
           },
           async execute(args, context) {
             const seatId = safeSeat(args.seatId);
-            const seat = requireSeat(seats, context.sessionID, seatId);
-            const result = await delegate.steer(seat.handle, {
+            const handle = await resolveLiveHandle(
+              seats,
+              providerRuntime,
+              context.sessionID,
+              seatId,
+            );
+            const result = await delegate.steer(handle, {
               prompt: args.prompt,
-              timeoutMs: args.timeoutMs ?? options.defaults.timeoutMs,
+              timeoutMs: args.timeoutMs ?? 10_000,
             });
             return {
               title: `Steered Codex seat ${seatId}`,
@@ -375,11 +399,77 @@ export function createCodexDelegatePlugin(
           },
           async execute(args, context) {
             const seatId = safeSeat(args.seatId);
-            const seat = requireSeat(seats, context.sessionID, seatId);
+            const handle = await resolveLiveHandle(
+              seats,
+              providerRuntime,
+              context.sessionID,
+              seatId,
+            );
             return inspectionOutput(
-              await delegate.cancel(seat.handle),
+              await delegate.cancel(handle),
               `Cancelled Codex seat ${seatId}`,
             );
+          },
+        }),
+        codex_usage: tool({
+          description:
+            "Read Codex account usage and rate-limit buckets for an attached seat without starting a turn.",
+          args: {
+            seatId: tool.schema
+              .string()
+              .optional()
+              .describe("Delegate seat name; defaults to codex"),
+          },
+          async execute(args, context) {
+            const seatId = safeSeat(args.seatId);
+            const handle = await resolveLiveHandle(
+              seats,
+              providerRuntime,
+              context.sessionID,
+              seatId,
+            );
+            const summary = await delegate.usage(handle);
+            return usageOutput(seatId, summary);
+          },
+        }),
+        codex_close: tool({
+          description:
+            "Close an attached Codex seat. Cleanup (default true) removes a managed worktree and deletes the Codex thread.",
+          args: {
+            seatId: tool.schema
+              .string()
+              .optional()
+              .describe("Delegate seat name; defaults to codex"),
+            cleanup: tool.schema
+              .boolean()
+              .optional()
+              .describe(
+                "Drop the managed worktree and delete the thread; defaults to true",
+              ),
+          },
+          async execute(args, context) {
+            const seatId = safeSeat(args.seatId);
+            const handle = await resolveLiveHandle(
+              seats,
+              providerRuntime,
+              context.sessionID,
+              seatId,
+            );
+            const cleanup = args.cleanup !== false;
+            const providerClosed = await providerRuntime.closeHandle(
+              context.sessionID,
+              handle,
+              { cleanup },
+            );
+            if (!providerClosed) await delegate.close(handle, { cleanup });
+            seats.delete(seatKey(context.sessionID, seatId));
+            return {
+              title: `Closed Codex seat ${seatId}`,
+              output: cleanup
+                ? `Closed ${seatId} and requested worktree/thread cleanup.`
+                : `Closed ${seatId} and left the worktree and thread in place.`,
+              metadata: { seatId, cleanup },
+            };
           },
         }),
         codex_probe: tool({
@@ -425,7 +515,7 @@ async function openSeat(
   defaults: Defaults,
   context: ToolContext,
 ) {
-  if (current) await delegate.close(current.handle);
+  if (current) await delegate.close(current.handle, { cleanup: false });
   const input = {
     sessionID: context.sessionID,
     seatId,
@@ -678,18 +768,23 @@ function safeSeat(value: string | undefined) {
   return seat;
 }
 
-function requireSeat(
+async function resolveLiveHandle(
   seats: Map<string, Seat>,
+  providerRuntime: CodexProviderRuntime,
   sessionID: string,
   seatId: string,
 ) {
-  const seat = seats.get(seatKey(sessionID, seatId));
-  if (!seat)
-    throw new DelegatorError(
-      "INVALID_REQUEST",
-      `Codex seat ${seatId} is not attached in this session.`,
-    );
-  return seat;
+  const tool = seats.get(seatKey(sessionID, seatId));
+  if (tool) return tool.handle;
+  const provider = await providerRuntime.resolveHandle(
+    sessionID,
+    seatId === "codex" ? undefined : seatId,
+  );
+  if (provider) return provider;
+  throw new DelegatorError(
+    "INVALID_REQUEST",
+    `Codex seat ${seatId} is not attached in this session.`,
+  );
 }
 
 function reviewTarget(
@@ -733,9 +828,21 @@ function turnOutput(
   handle: DelegateHandle,
   result: DelegateTurnResult,
 ) {
+  const changes = compactChanges(result.changes);
+  const files = changes?.files ?? [];
+  const body = result.output || "Codex completed without text output.";
+  const changeBlock = files.length
+    ? `\n\n${changes?.summary} in ${changes?.cwd}:\n${files
+        .map((file) => `- ${file}`)
+        .join("\n")}${
+        changes?.filesTruncated
+          ? `\n- ... ${changes.fileCount - files.length} more files`
+          : ""
+      }`
+    : "";
   return {
     title: `${title} · ${handle.seatId}`,
-    output: result.output || "Codex completed without text output.",
+    output: `${body}${changeBlock}`,
     metadata: {
       delegateId: handle.id,
       seatId: handle.seatId,
@@ -746,6 +853,7 @@ function turnOutput(
       usage: result.usage,
       truncated: result.truncated,
       malformedEvents: result.malformedEvents,
+      changes,
     },
   };
 }
@@ -754,15 +862,59 @@ function inspectionOutput(
   inspection: DelegateInspection,
   title = `Codex seat ${inspection.handle.seatId}`,
 ) {
+  const lastTurn = inspection.lastTurn
+    ? {
+        id: inspection.lastTurn.id,
+        status: inspection.lastTurn.status,
+        usage: inspection.lastTurn.usage,
+        threadId: inspection.lastTurn.threadId,
+        turnId: inspection.lastTurn.turnId,
+        startedAt: inspection.lastTurn.startedAt,
+        completedAt: inspection.lastTurn.completedAt,
+        malformedEvents: inspection.lastTurn.malformedEvents,
+        truncated: inspection.lastTurn.truncated,
+        changes: compactChanges(inspection.lastTurn.changes),
+        error: inspection.lastTurn.error,
+      }
+    : null;
   return {
     title,
-    output: JSON.stringify(inspection, null, 2),
+    output: JSON.stringify({ ...inspection, lastTurn }, null, 2),
     metadata: {
       seatId: inspection.handle.seatId,
       status: inspection.status,
       transport: inspection.handle.transport,
       threadId: inspection.threadId,
       activeTurnId: inspection.activeTurnId,
+      activeKind: inspection.activeKind,
+      worktree: inspection.worktree,
+      isolation: inspection.isolation,
+    },
+  };
+}
+
+function compactChanges(changes: DelegateTurnResult["changes"]) {
+  if (!changes) return null;
+  return {
+    cwd: changes.cwd,
+    summary: changes.summary,
+    files: changes.files.slice(0, MAX_REPORTED_CHANGE_FILES),
+    fileCount: changes.files.length,
+    filesTruncated: changes.files.length > MAX_REPORTED_CHANGE_FILES,
+    patchTruncated: changes.truncated,
+  };
+}
+
+function usageOutput(seatId: string, summary: DelegateAccountUsage) {
+  return {
+    title: `Codex usage · ${seatId}`,
+    output: JSON.stringify(summary, null, 2),
+    metadata: {
+      seatId,
+      lifetimeTokens: summary.lifetimeTokens,
+      peakDailyTokens: summary.peakDailyTokens,
+      primaryUsedPercent: summary.primaryUsedPercent,
+      secondaryUsedPercent: summary.secondaryUsedPercent,
     },
   };
 }

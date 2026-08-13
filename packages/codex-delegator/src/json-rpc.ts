@@ -87,11 +87,14 @@ export class JsonRpcTransport implements RpcTransport {
         "initialize",
         {
           clientInfo: {
-            name: "codex-delegator",
-            title: "Codex Delegator",
-            version: "0.1.0",
+            name: "codex_opencode",
+            title: "OpenCode Codex Delegator",
+            version: "0.2.0-alpha.0",
           },
-          capabilities: { experimentalApi: false },
+          capabilities: {
+            experimentalApi: false,
+            requestAttestation: false,
+          },
         },
         { timeoutMs },
       );

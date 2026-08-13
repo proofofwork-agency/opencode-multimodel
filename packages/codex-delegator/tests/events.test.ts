@@ -30,6 +30,21 @@ describe("structured Codex events", () => {
       itemId: "i",
       text: "src/a.ts",
     });
+    expect(
+      decodeEvent({
+        method: "item/completed",
+        params: {
+          item: {
+            id: "review",
+            type: "exitedReviewMode",
+            review: "No findings.",
+          },
+        },
+      })[0],
+    ).toMatchObject({
+      kind: "text",
+      text: "No findings.",
+    });
   });
 
   test("replaces a streamed item with its completed snapshot without duplicating output", () => {

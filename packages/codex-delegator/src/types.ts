@@ -107,6 +107,14 @@ export type DelegateApprovalRequest = {
   metadata: Record<string, unknown>;
 };
 
+export type DelegateChanges = {
+  cwd: string;
+  files: string[];
+  summary: string;
+  patch: string | null;
+  truncated: boolean;
+};
+
 export type DelegateTurnResult = {
   id: string;
   status: "completed" | "failed" | "cancelled" | "rate-limited" | "ambiguous";
@@ -119,6 +127,7 @@ export type DelegateTurnResult = {
   completedAt: number;
   malformedEvents: number;
   truncated: boolean;
+  changes: DelegateChanges | null;
   error: { code: string; message: string; retryable: boolean } | null;
 };
 
@@ -148,8 +157,27 @@ export type DelegateInspection = {
   activeTurnId: string | null;
   capabilities: DelegateCapabilities;
   lastTurn: DelegateTurnResult | null;
+  activeKind: "turn" | "review" | null;
   createdAt: number;
   updatedAt: number;
+};
+
+export type DelegateAccountUsage = {
+  lifetimeTokens: number | null;
+  peakDailyTokens: number | null;
+  longestRunningTurnSec: number | null;
+  currentStreakDays: number | null;
+  longestStreakDays: number | null;
+  dailyUsageBuckets: Array<{ startDate: string; tokens: number }>;
+  primaryUsedPercent: number | null;
+  primaryResetsAt: number | null;
+  secondaryUsedPercent: number | null;
+  secondaryResetsAt: number | null;
+};
+
+export type CloseInput = {
+  /** Drop the managed worktree and delete the Codex thread. Defaults on for worktree seats. */
+  cleanup?: boolean;
 };
 
 export type ConnectInput = {
@@ -224,6 +252,10 @@ export interface Delegator {
   ): Promise<DelegateTurnResult>;
   cancel(session: DelegateHandle | string): Promise<DelegateInspection>;
   inspect(session: DelegateHandle | string): Promise<DelegateInspection>;
-  close(session: DelegateHandle | string): Promise<void>;
-  closeAll(): Promise<number>;
+  usage(session: DelegateHandle | string): Promise<DelegateAccountUsage>;
+  close(
+    session: DelegateHandle | string,
+    input?: CloseInput,
+  ): Promise<void>;
+  closeAll(input?: CloseInput): Promise<number>;
 }

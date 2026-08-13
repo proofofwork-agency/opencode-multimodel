@@ -101,8 +101,8 @@ async function fixture() {
     stateDir: join(root, "state"),
     openTransport: async (options) => new LaneTransport(options, tracker),
     ensureWorktree: async () => ({ sourceRoot: root, worktree: root }),
-    runCommand: async () => ({
-      stdout: "codex-cli 0.146.0",
+    runCommand: async (input) => ({
+      stdout: input.argv[0] === "git" ? "" : "codex-cli 0.146.0",
       stderr: "",
       exitCode: 0,
       signal: null,
@@ -187,6 +187,19 @@ describe("delegate seat scheduling", () => {
     await delegate.closeAll();
     expect((await hanging).status).toBe("cancelled");
     expect(tracker.closed).toBe(1);
+  });
+
+  test("close cancels the active turn and rejects queued work before teardown", async () => {
+    const { root, tracker, delegate } = await fixture();
+    const handle = await delegate.create({ seatId: "codex", cwd: root });
+    const hanging = delegate.turn(handle, "hang forever");
+    const queued = delegate.turn(handle, "must not start").catch((error) => error);
+    await Bun.sleep(20);
+    await delegate.close(handle);
+    expect((await hanging).status).toBe("cancelled");
+    expect(await queued).toMatchObject({ code: "SESSION_CLOSED" });
+    expect(tracker.starts).toBe(1);
+    expect((await delegate.inspect(handle)).status).toBe("closed");
   });
 });
 

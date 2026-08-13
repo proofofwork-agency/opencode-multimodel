@@ -64,6 +64,7 @@ export async function runCodexExec(input: {
     completedAt: Date.now(),
     malformedEvents: snapshot.malformed,
     truncated: snapshot.truncated || result.overflowed,
+    changes: null,
     error: error
       ? { code: error.code, message: error.message, retryable: error.retryable }
       : null,

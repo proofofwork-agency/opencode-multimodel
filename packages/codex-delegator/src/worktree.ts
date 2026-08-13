@@ -53,3 +53,19 @@ export async function ensureManagedWorktree(
   }
   return { sourceRoot: root, worktree };
 }
+
+export async function removeManagedWorktree(
+  sourceRoot: string,
+  worktree: string,
+  env: NodeJS.ProcessEnv,
+  runCommand: typeof runBounded = runBounded,
+) {
+  const removed = await runCommand({
+    argv: ["git", "worktree", "remove", "--force", worktree],
+    cwd: sourceRoot,
+    env,
+    timeoutMs: 60_000,
+  });
+  if (removed.exitCode !== 0 && (await Bun.file(join(worktree, ".git")).exists()))
+    throw commandError(removed, "Remove delegate worktree");
+}

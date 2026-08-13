@@ -25,11 +25,15 @@ import type {
   DelegateTurnResult,
   Delegator,
   ResumeInput,
+  CloseInput,
+  DelegateAccountUsage,
   ReviewInput,
   SteerInput,
   TurnInput,
 } from "./types.ts";
-import { ensureManagedWorktree } from "./worktree.ts";
+import { collectWorkspaceChanges } from "./changes.ts";
+import { decodeAccountUsage } from "./usage.ts";
+import { ensureManagedWorktree, removeManagedWorktree } from "./worktree.ts";
 
 const APP_SERVER_CAPABILITIES: DelegateCapabilities = {
   resume: true,
@@ -89,6 +93,9 @@ type Runtime = {
   env: NodeJS.ProcessEnv;
   threadId: string | null;
   activeTurnId: string | null;
+  activeKind: "turn" | "review" | null;
+  pendingWork: number;
+  closing: Promise<void> | null;
   activeController: AbortController | null;
   transport: RpcTransport | null;
   capabilities: DelegateCapabilities;
@@ -328,7 +335,12 @@ export class CodexDelegator implements Delegator {
     const isolation = input.isolation ?? "worktree";
     const approvalPolicy = input.approvalPolicy ?? "ask";
     const mode = input.mode ?? "write";
-    requireUnsafeConfirmation(isolation, approvalPolicy, input.confirmedUnsafe);
+    requireUnsafeConfirmation(
+      isolation,
+      approvalPolicy,
+      mode,
+      input.confirmedUnsafe,
+    );
     const env = { ...process.env, ...input.env };
     const sourceCwd = resolve(input.cwd);
     const placement =
@@ -352,10 +364,13 @@ export class CodexDelegator implements Delegator {
       approvalPolicy,
       mode,
       model: normalizeModel(input.model),
-      serviceName: this.options.serviceName?.trim() || "codex-delegator",
+      serviceName: this.options.serviceName?.trim() || "codex_opencode",
       env,
       threadId: null,
       activeTurnId: null,
+      activeKind: null,
+      pendingWork: 0,
+      closing: null,
       activeController: null,
       transport: null,
       capabilities: { ...APP_SERVER_CAPABILITIES },
@@ -421,7 +436,13 @@ export class CodexDelegator implements Delegator {
     const isolation = input.isolation ?? attachment?.isolation ?? "worktree";
     const approvalPolicy =
       input.approvalPolicy ?? attachment?.approvalPolicy ?? "ask";
-    requireUnsafeConfirmation(isolation, approvalPolicy, input.confirmedUnsafe);
+    const mode = input.mode ?? attachment?.mode ?? "write";
+    requireUnsafeConfirmation(
+      isolation,
+      approvalPolicy,
+      mode,
+      input.confirmedUnsafe,
+    );
     const env = { ...process.env, ...input.env };
     const placement =
       attachment?.worktree &&
@@ -458,12 +479,15 @@ export class CodexDelegator implements Delegator {
       worktree: isolation === "worktree" ? placement.worktree : null,
       isolation,
       approvalPolicy,
-      mode: input.mode ?? attachment?.mode ?? "write",
+      mode,
       model: normalizeModel(input.model ?? attachment?.model),
-      serviceName: this.options.serviceName?.trim() || "codex-delegator",
+      serviceName: this.options.serviceName?.trim() || "codex_opencode",
       env,
       threadId,
       activeTurnId: null,
+      activeKind: null,
+      pendingWork: 0,
+      closing: null,
       activeController: null,
       transport: null,
       capabilities: { ...APP_SERVER_CAPABILITIES },
@@ -512,7 +536,7 @@ export class CodexDelegator implements Delegator {
     const runtime = this.require(session);
     const request = typeof input === "string" ? { prompt: input } : input;
     const prompt = checkedPrompt(request.prompt);
-    return this.lane(runtime, () => this.runTurn(runtime, request, prompt));
+    return this.enqueue(runtime, () => this.runTurn(runtime, request, prompt));
   }
 
   private async runTurn(
@@ -530,7 +554,7 @@ export class CodexDelegator implements Delegator {
       runtime.status = "running";
       runtime.updatedAt = this.now();
       try {
-        const result = await this.exec({
+        const executed = await this.exec({
           executable: this.executable,
           cwd: runtime.cwd,
           env: runtime.env,
@@ -544,6 +568,10 @@ export class CodexDelegator implements Delegator {
           signal: controller.signal,
           onEvent: request.onEvent ?? runtime.onEvent,
         });
+        const result = {
+          ...executed,
+          changes: await this.workspaceChanges(runtime),
+        };
         runtime.threadId = result.threadId ?? runtime.threadId;
         runtime.lastTurn = result;
         runtime.status = result.status === "failed" ? "failed" : "idle";
@@ -569,6 +597,7 @@ export class CodexDelegator implements Delegator {
         input: userInput(prompt),
         model: runtime.model,
         effort: normalizeReasoningEffort(request.reasoningEffort),
+        outputSchema: null,
         approvalPolicy: approvalPolicy(runtime),
       },
       request,
@@ -584,11 +613,15 @@ export class CodexDelegator implements Delegator {
       );
     }
     const request = typeof input === "string" ? { prompt: input } : input;
-    const expectedTurnId = request.expectedTurnId ?? runtime.activeTurnId;
-    if (!expectedTurnId || runtime.status !== "running") {
+    const expectedTurnId = await this.waitForActiveTurn(
+      runtime,
+      request.expectedTurnId,
+      boundedTimeout(request.timeoutMs ?? 10_000),
+    );
+    if (runtime.activeKind === "review") {
       throw new DelegatorError(
         "INVALID_REQUEST",
-        "Codex steering requires an active turn identifier.",
+        "Codex steering is not available during a native review.",
       );
     }
     const result = object(
@@ -597,6 +630,7 @@ export class CodexDelegator implements Delegator {
         {
           threadId: runtime.threadId,
           expectedTurnId,
+          clientUserMessageId: crypto.randomUUID(),
           input: userInput(checkedPrompt(request.prompt)),
         },
         { timeoutMs: boundedTimeout(request.timeoutMs ?? 10_000) },
@@ -607,8 +641,8 @@ export class CodexDelegator implements Delegator {
 
   async review(session: DelegateHandle | string, input: ReviewInput = {}) {
     const runtime = this.require(session);
-    return this.lane(runtime, async () => {
-      this.requireIdle(runtime);
+    return this.enqueue(runtime, async () => {
+      this.requireIdle(runtime, { allowAmbiguous: true });
       if (!runtime.capabilities.review || !runtime.transport) {
         throw new DelegatorError(
           "CAPABILITY_UNAVAILABLE",
@@ -654,42 +688,72 @@ export class CodexDelegator implements Delegator {
     return this.snapshot(this.require(session));
   }
 
-  async close(session: DelegateHandle | string) {
+  async usage(
+    session: DelegateHandle | string,
+  ): Promise<DelegateAccountUsage> {
+    const runtime = this.require(session);
+    if (!runtime.transport)
+      throw new DelegatorError(
+        "CAPABILITY_UNAVAILABLE",
+        "The active Codex fallback does not support account usage reads.",
+      );
+    const usage = await runtime.transport.request(
+      "account/usage/read",
+      {},
+      { timeoutMs: 10_000 },
+    );
+    const rateLimits = await runtime.transport
+      .request("account/rateLimits/read", {}, { timeoutMs: 10_000 })
+      .catch(() => null);
+    return decodeAccountUsage(usage, rateLimits);
+  }
+
+  async close(session: DelegateHandle | string, input: CloseInput = {}) {
     const runtime = this.require(session);
     if (runtime.status === "closed") return;
-    await this.cancel(runtime.handle).catch(() => undefined);
-    await runtime.transport?.close().catch(() => undefined);
-    runtime.transport = null;
-    runtime.status = "closed";
-    runtime.updatedAt = this.now();
-    await this.persist(runtime);
+    if (runtime.closing) return runtime.closing;
+    const closing = this.closeRuntime(runtime, input);
+    runtime.closing = closing;
+    try {
+      await closing;
+    } finally {
+      if (runtime.closing === closing) runtime.closing = null;
+    }
   }
 
   /**
    * Shut every delegate this instance owns down. Children are spawned detached, so
    * without this every `codex app-server` outlives the host process as an orphan.
-   * Active turns are aborted and transports closed before the first `await` returns,
-   * which keeps the teardown useful even from a handler that cannot await.
+   * Each seat drains its lane after cancellation before its thread or worktree is
+   * released, so queued work cannot race cleanup.
    */
-  async closeAll(): Promise<number> {
+  async closeAll(input: CloseInput = {}): Promise<number> {
     const runtimes = [...this.sessions.values()].filter(
       (runtime) => runtime.status !== "closed",
     );
-    const closing = runtimes.map((runtime) => {
-      runtime.activeController?.abort("delegate shutting down");
-      runtime.activeController = null;
-      runtime.activeTurnId = null;
-      runtime.status = "closed";
-      runtime.updatedAt = this.now();
-      const transport = runtime.transport;
-      runtime.transport = null;
-      return Promise.all([
-        transport?.close().catch(() => undefined),
-        this.persist(runtime),
-      ]);
-    });
+    const closing = runtimes.map((runtime) => this.close(runtime.handle, input));
     await Promise.all([...closing, this.closeLoginTransport()]);
     return runtimes.length;
+  }
+
+  private async closeRuntime(runtime: Runtime, input: CloseInput) {
+    const cleanup = shouldCleanup(runtime, input.cleanup);
+    const dropWorktree = cleanup && isManagedWorktree(runtime);
+    await this.cancel(runtime.handle).catch(() => undefined);
+    await runtime.lane.catch(() => undefined);
+    const threadDeleted = await this.releaseThread(runtime, cleanup);
+    if (threadDeleted) runtime.threadId = null;
+    if (dropWorktree) {
+      await this.dropManagedWorktree(runtime);
+      runtime.worktree = null;
+    }
+    await runtime.transport?.close().catch(() => undefined);
+    runtime.transport = null;
+    runtime.status = "closed";
+    runtime.activeTurnId = null;
+    runtime.activeKind = null;
+    runtime.updatedAt = this.now();
+    await this.persist(runtime);
   }
 
   /**
@@ -698,6 +762,13 @@ export class CodexDelegator implements Delegator {
    * `SESSION_BUSY` invariant, while different seats stay fully concurrent — running many
    * vendors at once is the product. `steer` and `cancel` deliberately skip this lane.
    */
+  private enqueue<T>(runtime: Runtime, work: () => Promise<T>) {
+    runtime.pendingWork += 1;
+    return this.lane(runtime, work).finally(() => {
+      runtime.pendingWork -= 1;
+    });
+  }
+
   private async lane<T>(runtime: Runtime, work: () => Promise<T>): Promise<T> {
     const previous = runtime.lane;
     const gate = Promise.withResolvers<void>();
@@ -728,6 +799,7 @@ export class CodexDelegator implements Delegator {
     const forwardAbort = () => controller.abort(input.signal?.reason);
     input.signal?.addEventListener("abort", forwardAbort, { once: true });
     runtime.activeController = controller;
+    runtime.activeKind = method === "review/start" ? "review" : "turn";
     runtime.status = "running";
     runtime.delivery = "none";
     runtime.updatedAt = startedAt;
@@ -826,26 +898,31 @@ export class CodexDelegator implements Delegator {
         );
       const snapshot = collector.snapshot();
       const status = snapshot.status ?? "completed";
-      const result: DelegateTurnResult = {
-        id: crypto.randomUUID(),
-        status,
-        output: snapshot.output,
-        events: snapshot.events,
-        usage: snapshot.usage,
-        threadId: resultThreadId ?? snapshot.threadId ?? runtime.threadId,
-        turnId: snapshot.turnId ?? runtime.activeTurnId,
-        startedAt,
-        completedAt: this.now(),
-        malformedEvents: snapshot.malformed,
-        truncated: snapshot.truncated,
-        error: snapshot.error
-          ? {
-              code: status === "rate-limited" ? "RATE_LIMITED" : "TURN_FAILED",
-              message: snapshot.error,
-              retryable: status === "rate-limited",
-            }
-          : null,
-      };
+      const result = await this.finalizeTurn(
+        runtime,
+        {
+          id: crypto.randomUUID(),
+          status,
+          output: snapshot.output,
+          events: snapshot.events,
+          usage: snapshot.usage,
+          threadId: resultThreadId ?? snapshot.threadId ?? runtime.threadId,
+          turnId: snapshot.turnId ?? runtime.activeTurnId,
+          startedAt,
+          completedAt: this.now(),
+          malformedEvents: snapshot.malformed,
+          truncated: snapshot.truncated,
+          changes: null,
+          error: snapshot.error
+            ? {
+                code: status === "rate-limited" ? "RATE_LIMITED" : "TURN_FAILED",
+                message: snapshot.error,
+                retryable: status === "rate-limited",
+              }
+            : null,
+        },
+        method,
+      );
       runtime.lastTurn = result;
       runtime.delivery = "completed";
       runtime.status = status === "failed" ? "failed" : "idle";
@@ -889,24 +966,29 @@ export class CodexDelegator implements Delegator {
               ? "ambiguous"
               : "failed";
       const snapshot = collector.snapshot();
-      const result: DelegateTurnResult = {
-        id: crypto.randomUUID(),
-        status,
-        output: snapshot.output,
-        events: snapshot.events,
-        usage: snapshot.usage ?? { ...EMPTY_USAGE },
-        threadId: resultThreadId ?? snapshot.threadId ?? runtime.threadId,
-        turnId: snapshot.turnId ?? runtime.activeTurnId,
-        startedAt,
-        completedAt: this.now(),
-        malformedEvents: snapshot.malformed,
-        truncated: snapshot.truncated,
-        error: {
-          code: failure.code,
-          message: failure.message,
-          retryable: failure.retryable,
+      const result = await this.finalizeTurn(
+        runtime,
+        {
+          id: crypto.randomUUID(),
+          status,
+          output: snapshot.output,
+          events: snapshot.events,
+          usage: snapshot.usage ?? { ...EMPTY_USAGE },
+          threadId: resultThreadId ?? snapshot.threadId ?? runtime.threadId,
+          turnId: snapshot.turnId ?? runtime.activeTurnId,
+          startedAt,
+          completedAt: this.now(),
+          malformedEvents: snapshot.malformed,
+          truncated: snapshot.truncated,
+          changes: null,
+          error: {
+            code: failure.code,
+            message: failure.message,
+            retryable: failure.retryable,
+          },
         },
-      };
+        method,
+      );
       runtime.lastTurn = result;
       runtime.delivery = status === "ambiguous" ? "ambiguous" : "none";
       runtime.status =
@@ -924,6 +1006,7 @@ export class CodexDelegator implements Delegator {
       input.signal?.removeEventListener("abort", forwardAbort);
       runtime.activeController = null;
       runtime.activeTurnId = null;
+      runtime.activeKind = null;
     }
   }
 
@@ -1023,17 +1106,85 @@ export class CodexDelegator implements Delegator {
    * on purpose — nothing honours a retry flag, and a caller that reaches this state would
    * only spin. Reports the seat, never the internal delegate uuid.
    */
-  private requireIdle(runtime: Runtime) {
-    if (runtime.status === "closed")
+  private requireIdle(
+    runtime: Runtime,
+    options: { allowAmbiguous?: boolean } = {},
+  ) {
+    if (runtime.status === "closed" || runtime.closing)
       throw new DelegatorError(
         "SESSION_CLOSED",
         `Codex seat ${runtime.handle.seatId} is closed.`,
+      );
+    if (runtime.status === "ambiguous" && !options.allowAmbiguous)
+      throw new DelegatorError(
+        "AMBIGUOUS_DELIVERY",
+        `Codex seat ${runtime.handle.seatId} has an ambiguous delivery; inspect the worktree before starting another turn.`,
       );
     if (runtime.activeController)
       throw new DelegatorError(
         "SESSION_BUSY",
         `Codex seat ${runtime.handle.seatId} already has an active turn.`,
       );
+  }
+
+  private async waitForActiveTurn(
+    runtime: Runtime,
+    expectedTurnId: string | undefined,
+    timeoutMs: number,
+  ) {
+    if (!this.hasLiveTurn(runtime) && runtime.pendingWork <= 0) {
+      throw new DelegatorError(
+        "INVALID_REQUEST",
+        "Codex steering requires an active turn identifier.",
+      );
+    }
+    const deadline = Date.now() + timeoutMs;
+    let turnId = expectedTurnId ?? runtime.activeTurnId;
+    while (
+      !turnId ||
+      (runtime.status !== "running" && runtime.status !== "awaiting-approval")
+    ) {
+      if (Date.now() >= deadline || (!this.hasLiveTurn(runtime) && runtime.pendingWork <= 0)) {
+        throw new DelegatorError(
+          "INVALID_REQUEST",
+          "Codex steering requires an active turn identifier.",
+        );
+      }
+      await Bun.sleep(25);
+      turnId = expectedTurnId ?? runtime.activeTurnId;
+    }
+    return turnId;
+  }
+
+  private hasLiveTurn(runtime: Runtime) {
+    return Boolean(
+      runtime.activeController ||
+        runtime.status === "running" ||
+        runtime.status === "awaiting-approval",
+    );
+  }
+
+  private workspaceChanges(runtime: Runtime) {
+    return collectWorkspaceChanges(runtime.cwd, runtime.env, this.command);
+  }
+
+  private async finalizeTurn(
+    runtime: Runtime,
+    result: DelegateTurnResult,
+    method: "turn/start" | "review/start",
+  ): Promise<DelegateTurnResult> {
+    const changes = await this.workspaceChanges(runtime);
+    if (method !== "review/start" || result.output.trim())
+      return { ...result, changes };
+    return {
+      ...result,
+      changes,
+      output: changes?.files.length
+        ? `Codex finished the review without text. Local changes still present:\n${changes.files
+            .map((file) => `- ${file}`)
+            .join("\n")}`
+        : "Codex finished the review without text. The checkout has no local changes to review.",
+    };
   }
 
   private snapshot(runtime: Runtime): DelegateInspection {
@@ -1051,9 +1202,48 @@ export class CodexDelegator implements Delegator {
       activeTurnId: runtime.activeTurnId,
       capabilities: runtime.capabilities,
       lastTurn: runtime.lastTurn,
+      activeKind: runtime.activeKind,
       createdAt: runtime.createdAt,
       updatedAt: runtime.updatedAt,
     });
+  }
+
+  private async releaseThread(runtime: Runtime, cleanup: boolean) {
+    if (!runtime.threadId) return cleanup;
+    if (!runtime.transport) {
+      if (cleanup && runtime.handle.transport === "app-server")
+        throw new DelegatorError(
+          "CAPABILITY_UNAVAILABLE",
+          "Codex thread cleanup requires an active app-server transport.",
+        );
+      return false;
+    }
+    await runtime.transport
+      .request(
+        "thread/unsubscribe",
+        { threadId: runtime.threadId },
+        { timeoutMs: 5_000 },
+      )
+      .catch(() => undefined);
+    if (!cleanup) return false;
+    await runtime.transport
+      .request(
+        "thread/delete",
+        { threadId: runtime.threadId },
+        { timeoutMs: 5_000 },
+      );
+    return true;
+  }
+
+  private async dropManagedWorktree(runtime: Runtime) {
+    if (runtime.isolation !== "worktree" || !runtime.worktree) return;
+    if (!runtime.worktree.includes(".codex-delegate-worktrees")) return;
+    await removeManagedWorktree(
+      runtime.sourceCwd,
+      runtime.worktree,
+      runtime.env,
+      this.command,
+    );
   }
 
   private persist(runtime: Runtime) {
@@ -1187,12 +1377,32 @@ function modelsFromResponse(value: unknown): DelegateModel[] {
   });
 }
 
+function shouldCleanup(
+  runtime: Pick<Runtime, "isolation" | "worktree">,
+  cleanup?: boolean,
+) {
+  if (cleanup !== undefined) return cleanup;
+  return isManagedWorktree(runtime);
+}
+
+function isManagedWorktree(
+  runtime: Pick<Runtime, "isolation" | "worktree">,
+) {
+  return (
+    runtime.isolation === "worktree" &&
+    Boolean(runtime.worktree?.includes(".codex-delegate-worktrees"))
+  );
+}
+
 function requireUnsafeConfirmation(
   isolation: string,
   approval: string,
+  mode: string,
   confirmed: boolean | undefined,
 ) {
   if (isolation === "worktree" && approval !== "bypass") return;
+  if (isolation === "current" && mode === "read-only" && approval !== "bypass")
+    return;
   if (confirmed) return;
   throw new DelegatorError(
     "INVALID_REQUEST",

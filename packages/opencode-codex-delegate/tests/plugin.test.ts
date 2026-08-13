@@ -19,9 +19,12 @@ import {
   type ReviewInput,
   type SteerInput,
   type TurnInput,
+  type CloseInput,
+  type DelegateAccountUsage,
 } from "codex-delegator";
 import { createCodexDelegatePlugin } from "../src/plugin.ts";
 import { createCodexDelegateProvider } from "../src/provider.ts";
+import { CodexProviderRuntime } from "../src/provider-runtime.ts";
 import serverModule from "../src/server.ts";
 import tuiModule from "../src/tui.ts";
 
@@ -36,9 +39,14 @@ class FakeDelegate {
     handle: DelegateHandle | string;
     input?: ReviewInput;
   }> = [];
-  readonly closes: Array<DelegateHandle | string> = [];
+  readonly closes: Array<{
+    handle: DelegateHandle | string;
+    cleanup?: boolean;
+  }> = [];
   closeAllCalls = 0;
   resultStatus: DelegateTurnResult["status"] = "completed";
+  turnResult: DelegateTurnResult | null = null;
+  inspectionLastTurn: DelegateTurnResult | null = null;
 
   async probe(_input?: ConnectInput): Promise<DelegateProbe> {
     return {
@@ -116,7 +124,7 @@ class FakeDelegate {
         usage: null,
       });
     }
-    return result(this.resultStatus);
+    return this.turnResult ?? result(this.resultStatus);
   }
 
   async review(handle: DelegateHandle | string, input?: ReviewInput) {
@@ -137,15 +145,33 @@ class FakeDelegate {
   }
 
   async inspect(handle: DelegateHandle | string) {
-    return inspection(
-      typeof handle === "string"
-        ? { id: handle, seatId: "codex", transport: "app-server" }
-        : handle,
-    );
+    return {
+      ...inspection(
+        typeof handle === "string"
+          ? { id: handle, seatId: "codex", transport: "app-server" }
+          : handle,
+      ),
+      lastTurn: this.inspectionLastTurn,
+    };
   }
 
-  async close(handle: DelegateHandle | string) {
-    this.closes.push(handle);
+  async usage(_handle: DelegateHandle | string): Promise<DelegateAccountUsage> {
+    return {
+      lifetimeTokens: 1_234_567,
+      peakDailyTokens: 45_678,
+      longestRunningTurnSec: 540,
+      currentStreakDays: 8,
+      longestStreakDays: 14,
+      dailyUsageBuckets: [{ startDate: "2026-06-18", tokens: 12_345 }],
+      primaryUsedPercent: 40,
+      primaryResetsAt: 1_700_000_000,
+      secondaryUsedPercent: 10,
+      secondaryResetsAt: 1_700_001_000,
+    };
+  }
+
+  async close(handle: DelegateHandle | string, input?: CloseInput) {
+    this.closes.push({ handle, cleanup: input?.cleanup });
   }
 
   async closeAll() {
@@ -190,11 +216,13 @@ describe("OpenCode Codex delegate plugin", () => {
     });
     expect(Object.keys(hooks.tool ?? {}).sort()).toEqual([
       "codex_cancel",
+      "codex_close",
       "codex_delegate",
       "codex_probe",
       "codex_review",
       "codex_status",
       "codex_steer",
+      "codex_usage",
     ]);
 
     const asks: unknown[] = [];
@@ -216,7 +244,7 @@ describe("OpenCode Codex delegate plugin", () => {
       {
         executable: undefined,
         stateDir: join(root, ".state"),
-        serviceName: "opencode-codex-delegate",
+        serviceName: "codex_opencode",
       },
     ]);
     expect(first).toMatchObject({
@@ -318,6 +346,150 @@ describe("OpenCode Codex delegate plugin", () => {
       output: "done",
     });
     await hooks.dispose!();
+  });
+
+  test("reviews uncommitted changes in the current checkout and reuses a writer seat", async () => {
+    const root = await mkdtemp(join(tmpdir(), "opencode-codex-review-tree-"));
+    const delegate = new FakeDelegate();
+    const hooks = await createCodexDelegatePlugin({
+      createDelegator: () => delegate,
+    })(pluginInput(root));
+    const context = toolContext(root, "session-a", []);
+    await hooks.tool!.codex_delegate!.execute(
+      { prompt: "write a test", seatId: "codex" },
+      context,
+    );
+    await hooks.tool!.codex_review!.execute(
+      { scope: "uncommitted", seatId: "codex" },
+      context,
+    );
+    expect(delegate.creates).toHaveLength(1);
+    expect(delegate.closes).toHaveLength(0);
+    expect(delegate.reviews[0]?.input).toMatchObject({
+      target: { type: "uncommittedChanges" },
+    });
+
+    await hooks.tool!.codex_review!.execute(
+      { scope: "uncommitted" },
+      context,
+    );
+    expect(delegate.creates[1]).toMatchObject({
+      seatId: "codex-review",
+      mode: "read-only",
+      isolation: "current",
+    });
+    await hooks.dispose!();
+  });
+
+  test("reads usage and closes a seat with optional cleanup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "opencode-codex-usage-"));
+    const delegate = new FakeDelegate();
+    const noisyTurn = {
+      ...result("completed"),
+      output: "large prior output",
+      events: [
+        {
+          sequence: 0,
+          kind: "text" as const,
+          method: "item/agentMessage/delta",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: "message-1",
+          text: "event payload that status must omit",
+          usage: null,
+        },
+      ],
+      changes: {
+        cwd: root,
+        files: ["src/index.ts"],
+        summary: "1 changed file",
+        patch: "patch payload that status and metadata must omit",
+        truncated: true,
+      },
+    } satisfies DelegateTurnResult;
+    delegate.turnResult = noisyTurn;
+    delegate.inspectionLastTurn = noisyTurn;
+    const hooks = await createCodexDelegatePlugin({
+      createDelegator: () => delegate,
+    })(pluginInput(root));
+    const context = toolContext(root, "session-a", []);
+    const turn = await hooks.tool!.codex_delegate!.execute(
+      { prompt: "write a test" },
+      context,
+    );
+    if (typeof turn === "string") throw new Error("Expected structured turn output");
+    expect(turn.metadata?.changes).toEqual({
+      cwd: root,
+      summary: "1 changed file",
+      files: ["src/index.ts"],
+      fileCount: 1,
+      filesTruncated: false,
+      patchTruncated: true,
+    });
+    expect(JSON.stringify(turn.metadata)).not.toContain("patch payload");
+    const usage = await hooks.tool!.codex_usage!.execute({}, context);
+    expect(usage).toMatchObject({
+      title: "Codex usage · codex",
+      metadata: { lifetimeTokens: 1_234_567, primaryUsedPercent: 40 },
+    });
+    const status = await hooks.tool!.codex_status!.execute({}, context);
+    if (typeof status === "string")
+      throw new Error("Expected structured status output");
+    expect(status).toMatchObject({
+      metadata: { activeKind: null, isolation: "current" },
+    });
+    expect(status.output).not.toContain("large prior output");
+    expect(status.output).not.toContain("event payload");
+    expect(status.output).not.toContain("patch payload");
+    expect(JSON.parse(status.output).lastTurn).toMatchObject({
+      status: "completed",
+      changes: {
+        files: ["src/index.ts"],
+        fileCount: 1,
+        patchTruncated: true,
+      },
+    });
+    await hooks.tool!.codex_close!.execute({ cleanup: false }, context);
+    expect(delegate.closes.at(-1)).toMatchObject({ cleanup: false });
+    await hooks.dispose!();
+  });
+
+  test("evicts a closed provider seat so the next provider run opens a fresh handle", async () => {
+    const root = await mkdtemp(join(tmpdir(), "opencode-codex-provider-close-"));
+    const delegate = new FakeDelegate();
+    const runtime = new CodexProviderRuntime({
+      directory: root,
+      defaults: {
+        mode: "write",
+        isolation: "worktree",
+        approvalPolicy: "ask",
+        timeoutMs: 30_000,
+        confirmedUnsafe: false,
+      },
+      delegate,
+    });
+    const input = {
+      sessionID: "session-provider-close",
+      agent: "build",
+      model: "gpt-5.6-sol",
+      fullPrompt: "Implement the parser.",
+      latestPrompt: "Implement the parser.",
+    };
+    await runtime.run(input);
+    const handle = await runtime.resolveHandle(input.sessionID, input.agent);
+    expect(handle).not.toBeNull();
+    expect(
+      await runtime.closeHandle(input.sessionID, handle!, { cleanup: true }),
+    ).toBe(true);
+
+    await runtime.run({
+      ...input,
+      messageID: "message-2",
+      latestPrompt: "Now add tests.",
+    });
+    expect(delegate.creates).toHaveLength(2);
+    expect(delegate.turns.at(-1)?.handle).toMatchObject({ id: "delegate-2" });
+    await runtime.dispose();
   });
 
   test("surfaces ambiguous delivery as a failed tool invocation", async () => {
@@ -516,6 +688,7 @@ function result(status: DelegateTurnResult["status"]): DelegateTurnResult {
     completedAt: 2,
     malformedEvents: 0,
     truncated: false,
+    changes: null,
     error:
       status === "completed"
         ? null
@@ -552,6 +725,7 @@ function inspection(handle: DelegateHandle): DelegateInspection {
       cancellation: true,
     },
     lastTurn: null,
+    activeKind: null,
     createdAt: 1,
     updatedAt: 2,
   };

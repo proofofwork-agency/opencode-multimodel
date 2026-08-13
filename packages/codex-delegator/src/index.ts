@@ -9,6 +9,8 @@ export {
   type RpcTransport,
   type ServerRequest,
 } from "./json-rpc.ts";
+export { collectWorkspaceChanges } from "./changes.ts";
+export { decodeAccountUsage } from "./usage.ts";
 export { AttachmentStore, type StoredAttachment } from "./store.ts";
 export type * from "./types.ts";
 
@@ -23,5 +25,6 @@ export const steer = delegate.steer.bind(delegate);
 export const review = delegate.review.bind(delegate);
 export const cancel = delegate.cancel.bind(delegate);
 export const inspect = delegate.inspect.bind(delegate);
+export const usage = delegate.usage.bind(delegate);
 export const close = delegate.close.bind(delegate);
 export const closeAll = delegate.closeAll.bind(delegate);
