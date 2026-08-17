@@ -1,6 +1,7 @@
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
-import { createGoalService, GoalOwnedError } from "./engine.ts";
+import { adaptGoalClient } from "./opencode.ts";
+import { GoalOwnedError, GoalService } from "./engine.ts";
 import { parseGoalCommand } from "./command.ts";
 import { formatHistory } from "./history.ts";
 import { isAbortError } from "./opencode.ts";
@@ -19,8 +20,14 @@ const server: Plugin = async (input, rawOptions) => {
     baseUrl: input.serverUrl?.toString(),
     directory: input.directory,
   });
-  const goals = createGoalService(input.directory, options, client, {
-    baseUrl: input.serverUrl?.toString(),
+  const goals = new GoalService({
+    ...options,
+    directory: input.directory,
+    client: adaptGoalClient(client, {
+      baseUrl: input.serverUrl?.toString(),
+      directory: input.directory,
+    }),
+    role: "server",
   });
   void goals.recoverActive().catch(() => undefined);
 

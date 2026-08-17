@@ -205,21 +205,27 @@ committed.
 
 ## Multiple processes
 
-Only one OpenCode process may drive a session's goal. Each process claims the
-session in `goal_locks` (owner UUID + pid, refreshed on every touch). A second
-process that opens the same session becomes **passive** for that goal:
+Ownership is **per session, not per terminal**. The server and the TUI of
+one OpenCode instance cooperate: the server registers itself in a
+`goal_services` table and the TUI adopts the live server's lock identity,
+so slash commands and auto-continue never fight each other within one
+instance. Idle sessions without goals are never locked.
+
+A different OpenCode instance that opens the **same session** becomes
+**passive** for that goal:
 
 - `/goal status` and `/goal history` still work (reads are allowed).
 - Mutations (`set`, `pause`, `resume`, `edit`, `clear`, completion tools)
-  fail closed with the stable error `session_owned_elsewhere`.
+  fail closed with the stable error `session_owned_elsewhere` and a message
+  explaining the per-session semantics.
 - Auto-continue from the passive process is skipped with the reason
   `session-owned-elsewhere`; it never prompts or mutates the goal.
 
-Locks expire 90 seconds after the last touch, or immediately when the owning
-process has died (pid liveness check), with a 10-minute hard cap. Restart
-recovery only takes over sessions whose owner is gone; it never steals a
-live owner's session. After the owner exits, retry a goal command or fork the
-session.
+Locks expire 90 seconds after the last touch (heartbeated while a goal is
+actively driven), or immediately when the owning process has died (pid
+liveness check), with a 10-minute hard cap. Restart recovery only takes
+over sessions whose owner is gone; it never steals a live owner's session.
+After the owner exits, retry a goal command or fork the session.
 
 `@proofofwork-agency/dogfood` is a regular dependency of this package. Installing
 the plugin installs the Dogfood CLI; users do not add it separately.

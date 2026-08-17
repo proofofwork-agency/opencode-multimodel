@@ -51,13 +51,20 @@ import {
 
 export type GoalServiceOptions = ContractRuntimeOptions & {
   now?: () => number;
+  /**
+   * "server" registers this process as the goal service (its lock owner
+   * identity can be adopted). "tui" adopts the live server's owner so the
+   * TUI and the server of one OpenCode instance cooperate instead of
+   * treating each other as foreign owners. Default: standalone identity.
+   */
+  role?: "server" | "tui";
 };
 
 export class GoalOwnedError extends Error {
   readonly code = "session_owned_elsewhere";
   constructor() {
     super(
-      "Another OpenCode process owns this session's goal. Close that process or fork the session, then retry.",
+      "Another OpenCode process is driving this same session's goal. This is per session, not per terminal: fork the session, or run /goal clear in the window that owns it, then retry.",
     );
     this.name = "GoalOwnedError";
   }
@@ -80,6 +87,12 @@ export class GoalService {
     this.store = new GoalStore(
       resolvePath(options.directory, options.databasePath),
     );
+    if (options.role === "server") {
+      this.store.registerService();
+    } else if (options.role === "tui") {
+      const adopted = this.store.adoptServiceOwner();
+      if (adopted) this.store.setOwner(adopted);
+    }
     this.snapshots = new GoalSnapshotStore(
       resolvePath(options.directory, options.snapshotDir),
     );
@@ -606,8 +619,12 @@ export class GoalService {
     if (this.store.foreignOwnerLive(sessionID)) {
       return { action: "skip" as const, reason: "session-owned-elsewhere" };
     }
-    this.store.tryLock(sessionID);
     const goal = this.store.get(sessionID);
+    if (
+      goal && (goal.status === "active" || goal.status === "budget_limited")
+    ) {
+      this.store.tryLock(sessionID);
+    }
     const now = this.now();
     const decision = decideContinuation({
       goal,

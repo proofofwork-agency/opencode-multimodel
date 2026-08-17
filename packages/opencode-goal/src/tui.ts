@@ -1,6 +1,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { parseGoalCommand } from "./command.ts";
-import { createGoalService } from "./engine.ts";
+import { GoalService } from "./engine.ts";
+import { adaptGoalClient } from "./opencode.ts";
 import { formatHistory } from "./history.ts";
 import { parseOptions } from "./options.ts";
 import { formatContractStatus, formatGoalStatus } from "./prompts.ts";
@@ -24,7 +25,14 @@ function firstLine(text: string) {
 
 const tui: TuiPlugin = async (api, rawOptions) => {
   const options = parseOptions(rawOptions);
-  const goals = createGoalService(api.state.path.directory, options, api.client);
+  const goals = new GoalService({
+    ...options,
+    directory: api.state.path.directory,
+    client: adaptGoalClient(api.client, {
+      directory: api.state.path.directory,
+    }),
+    role: "tui",
+  });
 
   const sessionID = () => {
     const current = api.route.current;

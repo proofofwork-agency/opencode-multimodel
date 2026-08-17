@@ -64,10 +64,12 @@ type GoalRow = {
   updated_at: number;
 };
 
+type OwnerID = `${string}-${string}-${string}-${string}-${string}`;
+
 export class GoalStore {
   readonly path: string;
   private readonly database: Database;
-  private readonly owner = crypto.randomUUID();
+  private owner: OwnerID = crypto.randomUUID();
 
   constructor(path: string) {
     this.path = resolve(path);
@@ -82,6 +84,44 @@ export class GoalStore {
     this.database
       .query("UPDATE goal_locks SET pid = ? WHERE owner = ?")
       .run(process.pid, this.owner);
+  }
+
+  get ownerID() {
+    return this.owner;
+  }
+
+  setOwner(owner: string) {
+    const next = owner as OwnerID;
+    if (next === this.owner) return;
+    this.database
+      .query("UPDATE goal_locks SET pid = ?, owner = ? WHERE owner = ?")
+      .run(process.pid, next, this.owner);
+    this.owner = next;
+  }
+
+  registerService() {
+    this.database
+      .query(
+        `INSERT INTO goal_services (owner, pid, started_at, heartbeat_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(owner) DO UPDATE SET pid = excluded.pid,
+           heartbeat_at = excluded.heartbeat_at`,
+      )
+      .run(this.owner, process.pid, Date.now(), Date.now());
+  }
+
+  adoptServiceOwner() {
+    const rows = this.database
+      .query<{ owner: string; pid: number }, []>(
+        "SELECT owner, pid FROM goal_services ORDER BY started_at DESC",
+      )
+      .all();
+    for (const row of rows) {
+      if (row.pid > 0 && row.pid !== process.pid && processAlive(row.pid)) {
+        return row.owner;
+      }
+    }
+    return undefined;
   }
 
   get(sessionID: string) {
@@ -555,6 +595,14 @@ export class GoalStore {
         owner TEXT NOT NULL,
         pid INTEGER,
         updated_at INTEGER NOT NULL
+      );
+    `);
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS goal_services (
+        owner TEXT PRIMARY KEY NOT NULL,
+        pid INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        heartbeat_at INTEGER NOT NULL
       );
     `);
     this.migrateGoalsTable();

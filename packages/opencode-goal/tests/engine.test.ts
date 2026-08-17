@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { GoalService } from "../src/engine.ts";
 import type { JudgeResult } from "../src/judge.ts";
 import { parseOptions } from "../src/options.ts";
@@ -487,7 +488,7 @@ test("a second process is passive while the owner holds the session", async () =
     passive.service.apply("ses", { action: "set", objective: "steal", checks: [] }, {
       start: false,
     }),
-  ).rejects.toThrow("owns this session's goal");
+  ).rejects.toThrow("driving this same session's goal");
   expect((await passive.service.handleIdle("ses")))
     .toMatchObject({ action: "skip", reason: "session-owned-elsewhere" });
   expect((await passive.service.maybeContinue("ses")))
@@ -626,5 +627,60 @@ test("recovery ignores queued sequence items", async () => {
   const goals = service.store.listForSession("ses");
   expect(goals[1]?.status).toBe("paused");
   expect(goals[1]?.pauseReason).toBe("queued");
+  service.close();
+});
+
+test("a TUI service adopts the live server's owner and cooperates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
+  const base = {
+    databasePath: join(directory, "goal.sqlite"),
+    snapshotDir: join(directory, "goals"),
+    minDelayMs: 0,
+  };
+  const serverish = await setup({ directory });
+  const serverOwner = serverish.service.store.ownerID;
+  await serverish.service.apply("ses", { action: "set", objective: "shared", checks: [] }, {
+    start: false,
+  });
+  // Simulate the real server process registration: a different live pid.
+  const sleeper = Bun.spawn({ cmd: [process.execPath, "-e", "setTimeout(() => {}, 30000)"] });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const db = new Database(join(directory, "goal.sqlite"));
+  db.query(
+    "INSERT INTO goal_services (owner, pid, started_at, heartbeat_at) VALUES (?, ?, 0, ?)",
+  ).run(serverOwner, sleeper.pid, Date.now());
+  db.close();
+
+  const tui = new GoalService({
+    ...parseOptions(base),
+    directory,
+    client: {
+      async prompt() { return { text: "ok", hadTools: true, tokens: 5 }; },
+      async session() { return {}; },
+    },
+    role: "tui",
+    now: () => 1_000,
+    evaluate: async () => ({ verdict: "not_met", reason: "working" }),
+  });
+  expect(tui.store.ownerID).toBe(serverOwner);
+  const receipt = await tui.apply("ses", { action: "pause" }, { start: false });
+  expect(receipt).toContain("paused");
+  await tui.apply("ses", { action: "resume" }, { start: false });
+  const continued = await tui.maybeContinue("ses");
+  expect(continued.action).not.toBe("skip");
+  tui.close();
+  serverish.service.close();
+  sleeper.kill();
+});
+
+test("idle sessions without goals are never locked by maybeContinue", async () => {
+  const { service } = await setup();
+  await service.maybeContinue("fresh-session");
+  const locks = (service.store as unknown as { path: string });
+  void locks;
+  const db = new Database(locks.path, { readonly: true });
+  const rows = db.query("SELECT session_id FROM goal_locks").all();
+  db.close();
+  expect(rows).toEqual([]);
   service.close();
 });
