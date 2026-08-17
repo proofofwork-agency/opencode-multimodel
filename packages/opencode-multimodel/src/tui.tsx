@@ -76,7 +76,11 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     api.state.path.directory,
     options.workflows,
   );
-  const runner = new OpenCodeAgentRunner(client, store);
+  const runner = new OpenCodeAgentRunner(
+    client,
+    store,
+    api.state.path.directory,
+  );
   const runs = new RunService(store, runner, options);
   const composer = createComposerController(
     options,

@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "@opencode-ai/sdk";
+import { withGoalContext } from "./goal-bridge.ts";
 import type { StateStore } from "./state.ts";
 import type {
   AgentReply,
@@ -92,6 +93,9 @@ const BLOCKED_NESTED_ORCHESTRATION_TOOLS = {
   multimodel_fleet: false,
   multimodel_run: false,
   multimodel_workflow: false,
+  goal_control: false,
+  create_goal: false,
+  update_goal: false,
   codex_delegate: false,
   codex_review: false,
   codex_status: false,
@@ -154,6 +158,7 @@ export class OpenCodeAgentRunner implements AgentRunner {
   constructor(
     private readonly client: AgentClient,
     private readonly store?: StateStore,
+    private readonly directory = process.cwd(),
   ) {}
 
   async run(input: RunAgentInput): Promise<AgentReply> {
@@ -184,7 +189,14 @@ export class OpenCodeAgentRunner implements AgentRunner {
         agent: input.member.agent,
         system: input.system,
         tools: BLOCKED_NESTED_ORCHESTRATION_TOOLS,
-        parts: [{ type: "text", text: input.prompt }],
+        parts: [{
+          type: "text",
+          text: withGoalContext(
+            this.directory,
+            input.parentSessionID,
+            input.prompt,
+          ),
+        }],
       });
       if (response.error) {
         throw new Error(`OpenCode prompt failed: ${describe(response.error)}`);
@@ -259,7 +271,10 @@ export class OpenCodeAgentRunner implements AgentRunner {
         model: child.member.model,
         agent: child.member.agent,
         tools: BLOCKED_NESTED_ORCHESTRATION_TOOLS,
-        parts: [{ type: "text", text: prompt }],
+        parts: [{
+          type: "text",
+          text: withGoalContext(this.directory, parentSessionID, prompt),
+        }],
       })
     ));
     responses.forEach((response) => {

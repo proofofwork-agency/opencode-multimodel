@@ -1,3 +1,4 @@
+import { withGoalContext } from "./goal-bridge.ts";
 import {
   CodexDelegator,
   DelegatorError,
@@ -86,8 +87,13 @@ export class CodexProviderRuntime {
       seat.lastResult
     )
       return structuredClone(seat.lastResult);
+    const prompt = seat.continuing ? input.latestPrompt : input.fullPrompt;
     const result = await this.delegate.turn(seat.handle, {
-      prompt: seat.continuing ? input.latestPrompt : input.fullPrompt,
+      prompt: withGoalContext(
+        this.options.directory,
+        input.sessionID,
+        prompt,
+      ),
       timeoutMs: this.options.defaults.timeoutMs,
       reasoningEffort: input.reasoningEffort,
       signal: input.signal,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -188,6 +188,37 @@ describe("OpenCode Codex delegate plugin", () => {
     expect(tuiModule.id).toBe("opencode-codex-delegate");
     expect(typeof tuiModule.tui).toBe("function");
     expect("server" in tuiModule).toBe(false);
+  });
+
+  test("prefixes Codex delegate turns with the parent OpenCode goal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "opencode-codex-delegate-"));
+    await mkdir(join(root, ".opencode", "goals"), { recursive: true });
+    await writeFile(
+      join(root, ".opencode", "goals", "session-a.json"),
+      JSON.stringify({
+        version: 1,
+        sessionID: "session-a",
+        objective: "all tests pass",
+        status: "active",
+      }),
+    );
+    const delegate = new FakeDelegate();
+    const plugin = createCodexDelegatePlugin({
+      createDelegator() {
+        return delegate;
+      },
+    });
+    const hooks = await plugin(pluginInput(root), { stateDir: ".state" });
+    await hooks.tool!.codex_delegate!.execute(
+      { prompt: "implement the failing test" },
+      toolContext(root, "session-a", []),
+    );
+    const prompt = typeof delegate.turns[0]?.input === "string"
+      ? delegate.turns[0]?.input
+      : delegate.turns[0]?.input.prompt;
+    expect(prompt).toContain("all tests pass");
+    expect(prompt).toContain("Do not invoke Codex CLI /goal");
+    expect(prompt).toContain("implement the failing test");
   });
 
   test("keeps the main entrypoint limited to one deduplicated plugin function", async () => {

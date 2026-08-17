@@ -25,6 +25,9 @@ only OpenCode's public plugin and SDK APIs.
   native session composer so the request and result stay in the normal chat.
 - `/workflow` starts a Claude Code-style dynamic workflow for a task, or runs
   a saved DAG or confined script when you name one.
+- An active `opencode-goal` on the parent session is injected into child
+  prompts. Goal continuation waits while a workflow or collaboration is
+  running so the two loops do not fight.
 - `/mode` and the clickable composer badge select `SINGLE`, `TEAM`, or
   `WORKFLOW` without replacing OpenCode's native prompt implementation.
   `WORKFLOW` uses the current session model by default, not the fleet's

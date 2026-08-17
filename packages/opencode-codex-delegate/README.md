@@ -39,6 +39,8 @@ Provider threads are persistent per OpenCode session and agent. Exact in-process
 
 The Codex app-server remains the agent runtime: it executes Codex CLI's own tools rather than OpenCode's tool or MCP registry. The registered models therefore advertise `tool_call: false` to prevent OpenCode from expecting client-executed tool calls.
 
+If `opencode-goal` has an active goal on the current OpenCode session, delegate turns and provider calls prepend that objective and tell Codex not to start CLI `/goal`. The OpenCode goal stays the outer loop.
+
 Provider execution uses the same safe defaults as the delegate tools: write mode in a managed detached worktree with on-request escalation. To deliberately let the provider operate in the current checkout, opt in explicitly:
 
 ```json

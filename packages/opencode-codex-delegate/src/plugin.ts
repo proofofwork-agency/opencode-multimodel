@@ -22,6 +22,7 @@ import {
   type DelegateAccountUsage,
   type ReviewTarget,
 } from "codex-delegator";
+import { withGoalContext } from "./goal-bridge.ts";
 import {
   CodexProviderRuntime,
   installProviderRuntime,
@@ -240,7 +241,11 @@ export function createCodexDelegatePlugin(
             const seat = await attach(args, context);
             const result = requireCompleted(
               await delegate.turn(seat.handle, {
-                prompt: args.prompt,
+                prompt: withGoalContext(
+                  context.directory ?? input.directory,
+                  context.sessionID,
+                  args.prompt,
+                ),
                 timeoutMs: args.timeoutMs ?? options.defaults.timeoutMs,
                 signal: context.abort,
               }),
@@ -378,7 +383,11 @@ export function createCodexDelegatePlugin(
               seatId,
             );
             const result = await delegate.steer(handle, {
-              prompt: args.prompt,
+              prompt: withGoalContext(
+                context.directory ?? input.directory,
+                context.sessionID,
+                args.prompt,
+              ),
               timeoutMs: args.timeoutMs ?? 10_000,
             });
             return {

@@ -55,7 +55,7 @@ const server: Plugin = async (input, rawOptions) => {
   );
   await store.initializeFleet(options.fleet ?? { leadID: "lead", members: [] });
   await loadWorkflowDirectories(store, input.directory, options.workflows);
-  const runner = new OpenCodeAgentRunner(client, store);
+  const runner = new OpenCodeAgentRunner(client, store, input.directory);
   const runs = new RunService(store, runner, options);
   const selections = new SessionSelectionCache();
   const readState = async (discover = false) => {

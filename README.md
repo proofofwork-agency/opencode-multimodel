@@ -9,6 +9,7 @@ dist-tag explicit until the APIs graduate from prerelease.
 | Package | Purpose | Alpha install |
 | --- | --- | --- |
 | [`opencode-multimodel`](./packages/opencode-multimodel) | Durable TEAM/WORKFLOW fleets, collaboration modes, dashboards, and workflows for OpenCode. | `bun add opencode-multimodel@alpha` |
+| [`opencode-goal`](./packages/opencode-goal) | Codex-style persisted `/goal` runtime that continues a session until evidence-backed completion. | `bun add opencode-goal@alpha` |
 | [`codex-delegator`](./packages/codex-delegator) | Reusable Bun library for driving a locally authenticated Codex CLI; this is the shared runtime, not an OpenCode plugin. | `bun add codex-delegator@alpha` |
 | [`opencode-codex-delegate`](./packages/opencode-codex-delegate) | OpenCode plugin, tools, and selectable AI SDK provider backed by `codex-delegator`. | `bun add opencode-codex-delegate@alpha` |
 | [`opencode-btw`](./packages/opencode-btw) | Ephemeral `/btw` side questions for OpenCode sessions without polluting the main transcript. | `bun add opencode-btw@alpha` |
@@ -20,6 +21,7 @@ All packages are configured to publish on npm under the `alpha` dist-tag. Once r
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     "opencode-multimodel@alpha",
+    "opencode-goal@alpha",
     "opencode-codex-delegate@alpha",
     "opencode-btw@alpha"
   ]

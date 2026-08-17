@@ -1,6 +1,7 @@
 export * from "./budget.ts";
 export * from "./collaborate.ts";
 export * from "./dynamic.ts";
+export * from "./goal-bridge.ts";
 export * from "./jury.ts";
 export * from "./opencode.ts";
 export * from "./orchestration.ts";
