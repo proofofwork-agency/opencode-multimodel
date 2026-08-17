@@ -159,10 +159,16 @@ describe("default dynamic workflow", () => {
     );
     expect(assigned.steps.map((step) => `${step.id}:${step.memberID}`)).toEqual([
       "understand:session",
-      "change:codex-delegate",
+      "change:session",
       "verify:session",
     ]);
 
+    const explicit = {
+      ...assigned,
+      steps: assigned.steps.map((step) =>
+        step.id === "change" ? { ...step, memberID: "codex-delegate" } : step
+      ),
+    };
     const calls: string[] = [];
     const runner: AgentRunner = {
       async run(input) {
@@ -179,7 +185,7 @@ describe("default dynamic workflow", () => {
       runner,
       fleet,
       "parent",
-      assigned,
+      explicit,
       "implement the fix",
     );
     expect(run.status).toBe("completed");
@@ -245,7 +251,7 @@ verify: codex-delegate
     ]);
   });
 
-  test("ignores invalid lead picks and keeps the auto assignment", async () => {
+  test("ignores invalid lead picks and keeps the work on the lead", async () => {
     const fleet = applySessionModel({ leadID: "lead", members: [] }, {
       model: { providerID: "xai", modelID: "grok-4.6" },
     });

@@ -41,9 +41,19 @@ test("server plugin registers Codex-style goal tools and handles /goal before th
     arguments: `fix auth --check "npm test" --budget 20k`,
   }, output as never);
   expect(output.parts[0]?.type).toBe("text");
+  expect(output.parts[0]?.text).toContain("<opencode_goal_receipt>");
   expect(output.parts[0]?.text).toContain(
     "A persisted thread goal is now active",
   );
+
+  const system: string[] = [];
+  await plugin["experimental.chat.system.transform"]?.({
+    sessionID: "ses_1",
+    model: { providerID: "test", modelID: "main" },
+  } as never, { system } as never);
+  expect(system.join("\n")).toContain("PERSISTED THREAD GOAL");
+  expect(system.join("\n")).toContain("get_goal");
+  expect(system.join("\n")).toContain("fix auth");
 
   const created = await plugin.tool!.get_goal!.execute({}, {
     sessionID: "ses_1",

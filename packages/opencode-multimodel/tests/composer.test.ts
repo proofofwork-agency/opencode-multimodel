@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { TuiPromptInfo } from "@opencode-ai/plugin/tui";
 import { parseOptions } from "../src/options.ts";
+import { parsePluginSlash } from "../src/slash.ts";
 import {
   collaborationComposerInput,
   composerSlotIsActive,
@@ -52,8 +53,16 @@ describe("native composer routing", () => {
     );
 
     expect(team.input).toBe("/collab jury Review this");
+    expect(parsePluginSlash(team.input)).toEqual({
+      kind: "collab",
+      args: "jury Review this",
+    });
     expect(team.parts).toBe(prompt.parts);
     expect(workflow.input).toBe("/workflow release Review this");
+    expect(parsePluginSlash(workflow.input)).toEqual({
+      kind: "workflow",
+      args: "release Review this",
+    });
     expect(workflow.parts).toBe(prompt.parts);
     expect(routeComposerPrompt(
       prompt,

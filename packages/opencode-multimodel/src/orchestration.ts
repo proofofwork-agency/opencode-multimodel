@@ -17,6 +17,7 @@ import type {
   DurableRun,
   Fleet,
   ModelRef,
+  RunStatus,
   WorkflowDefinition,
   WorkflowRun,
 } from "./types.ts";
@@ -76,11 +77,12 @@ export class RunService {
       status: "pending",
       mode: input.mode,
       participants,
-      steps: participants.map((memberID) => ({
-        id: memberID,
-        status: "pending",
-        memberID,
-      })),
+      steps: initialCollaborationSteps(
+        input.mode,
+        participants,
+        fleet.leadID,
+        input.handoffTo,
+      ),
       background: input.background,
       createdAt: now,
       updatedAt: now,
@@ -262,6 +264,7 @@ export class RunService {
       run.error = undefined;
       await this.store.saveRun(run);
       await this.waitUntilRunnable(run, controller.signal);
+      let writes = Promise.resolve();
       try {
         const result = await collaborate(
           this.runner,
@@ -279,10 +282,23 @@ export class RunService {
             runID: run.id,
             onActivity: (event) => {
               input.onActivity?.(event);
-              void this.store.appendEvent(run.id, "collaboration.activity", event);
+              writes = writes.then(async () => {
+                await this.store.appendEvent(
+                  run.id,
+                  "collaboration.activity",
+                  event,
+                );
+                if (
+                  applyCollaborationActivity(run, event) &&
+                  (run.status === "running" || run.status === "pending")
+                ) {
+                  await this.store.saveRun(run);
+                }
+              });
             },
           },
         );
+        await writes;
         run.status = "completed";
         run.final = result.final.text;
         run.participants = result.participants;
@@ -300,10 +316,12 @@ export class RunService {
           };
         });
       } catch (error) {
+        await writes.catch(() => undefined);
         run.status = controller.signal.aborted
           ? abortedStatus(controller.signal)
           : "failed";
         run.error = error instanceof Error ? error.message : String(error);
+        finalizeIncompleteSteps(run, run.status, run.error);
       }
       run.updatedAt = Date.now();
       await this.store.saveRun(run);
@@ -361,6 +379,10 @@ export class RunService {
         );
       }
       await this.waitUntilRunnable(run, controller.signal);
+      if (run.status === "pending" || run.status === "paused") {
+        run.status = "running";
+        await this.store.saveRun(run);
+      }
       const routed = await routeWorkflowAssignments({
         runner: this.runner,
         fleet,
@@ -399,6 +421,7 @@ export class RunService {
         ? abortedStatus(controller.signal)
         : "failed";
       run.error = error instanceof Error ? error.message : String(error);
+      finalizeIncompleteSteps(run, run.status, run.error);
       run.updatedAt = Date.now();
       await this.store.saveRun(run);
       return run;
@@ -510,4 +533,87 @@ function abortedStatus(signal: AbortSignal): "cancelled" | "stopped" {
   return String(signal.reason).toLowerCase().includes("stopped")
     ? "stopped"
     : "cancelled";
+}
+
+function initialCollaborationSteps(
+  mode: CollabMode,
+  participants: string[],
+  leadID: string,
+  handoffTo?: string,
+) {
+  const lead = {
+    id: leadID,
+    status: "pending" as const,
+    memberID: leadID,
+  };
+  if (mode === "lead" || mode === "orchestrate") return [lead];
+  if (mode === "pair" || mode === "handoff") {
+    const worker = handoffTo && participants.includes(handoffTo)
+      ? handoffTo
+      : participants.find((id) => id !== leadID);
+    return worker
+      ? [lead, { id: worker, status: "pending" as const, memberID: worker }]
+      : [lead];
+  }
+  return participants.map((memberID) => ({
+    id: memberID,
+    status: "pending" as const,
+    memberID,
+  }));
+}
+
+function applyCollaborationActivity(
+  run: CollaborationRun,
+  event: CollabActivity,
+) {
+  if (
+    event.phase === "idle" ||
+    event.phase === "queued" ||
+    event.phase === "waiting"
+  ) {
+    return false;
+  }
+  let step = run.steps.find((item) => item.memberID === event.memberID);
+  if (!step) {
+    step = {
+      id: event.memberID,
+      status: "pending",
+      memberID: event.memberID,
+    };
+    run.steps.push(step);
+  }
+  if (event.phase === "thinking" || event.phase === "synthesizing") {
+    if (step.status === "pending" || step.status === "interrupted") {
+      step.status = "running";
+      step.startedAt ??= Date.now();
+    }
+    step.output = event.detail;
+    return true;
+  }
+  if (event.phase === "error") {
+    const aborted = /abort|cancel|stopp/i.test(event.detail);
+    step.status = aborted ? "cancelled" : "failed";
+    step.error = event.detail;
+    step.completedAt = Date.now();
+    return true;
+  }
+  return false;
+}
+
+function finalizeIncompleteSteps(
+  run: DurableRun,
+  status: RunStatus,
+  error?: string,
+) {
+  const stepStatus = status === "failed" ? "failed" : "cancelled";
+  run.steps.forEach((step) => {
+    if (
+      step.status !== "pending" &&
+      step.status !== "running" &&
+      step.status !== "interrupted"
+    ) return;
+    step.status = stepStatus;
+    step.error ??= error;
+    step.completedAt = Date.now();
+  });
 }

@@ -49,6 +49,7 @@ export type Goal = {
   blocker?: string;
   lastVerdict?: GoalVerdict;
   lastPromptKind?: "start" | "continuation" | "budget_limit";
+  steerUntil?: number;
   createdAt: number;
   updatedAt: number;
 };

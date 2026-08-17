@@ -10,6 +10,13 @@ after Claude Code's `/btw` and Codex's `/side`.
 }
 ```
 
+Also add the same spec to `tui.json`. OpenCode loads server plugins from
+`opencode.json` and TUI plugins from `tui.json`; `/btw` only exists if the TUI
+entry loads.
+
+`/btw` and `/side` run immediately even while the main session is busy. They
+do not join the prompt queue.
+
 ## What it does
 
 `/btw <question>` (alias `/side`) asks a one-shot, context-aware side question

@@ -230,17 +230,14 @@ export function assignFleetToWorkflow(
 ): DagWorkflowDefinition {
   const seats = pickWorkflowSeats(fleet);
   if (seats.length === 0) return definition;
-  const used: string[] = [];
+  const lead = seats[0]!;
   return {
     ...definition,
     steps: definition.steps.map((step) => {
       if (step.memberID && resolveFleetSeat(fleet, step.memberID)) {
-        used.push(step.memberID);
         return step;
       }
-      const pick = suggestMemberForStep(step, fleet, used);
-      if (pick) used.push(pick.id);
-      return { ...step, memberID: pick?.id ?? step.memberID };
+      return { ...step, memberID: lead.id };
     }),
   };
 }
@@ -273,11 +270,11 @@ export async function routeWorkflowAssignments(input: {
   signal?: AbortSignal;
   runID?: string;
 }): Promise<DagWorkflowDefinition> {
-  const heuristic = assignFleetToWorkflow(input.definition, input.fleet);
+  const owned = assignFleetToWorkflow(input.definition, input.fleet);
   const seats = pickWorkflowSeats(input.fleet);
   const unassigned = input.definition.steps.filter((step) => !step.memberID);
   if (!input.runner || seats.length < 2 || unassigned.length === 0) {
-    return heuristic;
+    return owned;
   }
   const lead = seats[0]!;
   try {
@@ -290,7 +287,7 @@ export async function routeWorkflowAssignments(input: {
       stepID: "__route",
     });
     return applyLeadAssignments(
-      heuristic,
+      owned,
       input.fleet,
       reply.text,
       new Set(
@@ -300,7 +297,7 @@ export async function routeWorkflowAssignments(input: {
       ),
     );
   } catch {
-    return heuristic;
+    return owned;
   }
 }
 
@@ -330,17 +327,21 @@ function routingPrompt(
   leadID: string,
 ) {
   return [
-    `You are LEAD **${leadID}**. Assign each workflow step to the best fleet seat.`,
+    `You are LEAD **${leadID}**. You own every step unless you explicitly assign it.`,
     `Task:\n${task}`,
-    "Steps:",
+    "Steps (currently yours):",
     ...steps.map((step) =>
       `- ${step.id} (${workflowStepKind(step)}): ${step.prompt.split("\n")[0]}`
     ),
-    "Fleet (any of these may take any step):",
+    "Fleet. A worker starts only if you name it below:",
     ...seats.map((member) =>
       `- ${member.id}${member.id === leadID ? " (LEAD)" : ""} · ${member.role} · ${member.model.providerID}/${member.model.modelID}`
     ),
-    "Pick the strongest seat for the work. Prefer an implementation specialist for change/code, an independent seat for verify/review, and the lead for understand/plan unless another seat is clearly better.",
+    "Suggestions only — do not treat these as already started:",
+    ...steps.map((step) =>
+      `- ${step.id}: ${suggestMemberForStep(step, { leadID, members: seats })?.id ?? leadID}`
+    ),
+    "Keep a step on the lead unless another seat is clearly better. Never assign a seat you do not want started.",
     "Return exactly:",
     "ASSIGN:",
     ...steps.map((step) => `${step.id}: <seat-id>`),

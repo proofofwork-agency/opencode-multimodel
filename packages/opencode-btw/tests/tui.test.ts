@@ -13,6 +13,7 @@ function fakeApi() {
   const toasts: Array<{ variant?: string; message: string }> = [];
   const disposed: Array<() => void | Promise<void>> = [];
   const dialogs: Array<() => unknown> = [];
+  const intercepts: Array<{ name: string; priority?: number }> = [];
   const state = {
     routes,
     layers,
@@ -20,6 +21,7 @@ function fakeApi() {
     toasts,
     disposed,
     dialogs,
+    intercepts,
     config: { small_model: "test/small" } as { small_model?: string },
   };
   const api = {
@@ -76,6 +78,13 @@ function fakeApi() {
         layers.push(layer);
         return () => {};
       },
+      intercept(name: string, _fn: unknown, options?: { priority?: number }) {
+        intercepts.push({ name, priority: options?.priority });
+        return () => {};
+      },
+    },
+    renderer: {
+      currentFocusedEditor: null,
     },
     ui: {
       Dialog: () => null,
@@ -85,6 +94,7 @@ function fakeApi() {
         toasts.push(input);
       },
       dialog: {
+        open: false,
         replace(render: () => unknown) {
           dialogs.push(render);
         },
@@ -125,7 +135,7 @@ function command(state: ReturnType<typeof fakeApi>["state"], name: string) {
 }
 
 describe("TUI plugin", () => {
-  test("registers the answer route, slash commands, and history binding", async () => {
+  test("registers the answer route, slash commands, history binding, and submit intercept", async () => {
     const { api, state } = fakeApi();
     await startTui(api);
     expect(state.routes).toEqual(["btw.answer"]);
@@ -138,6 +148,7 @@ describe("TUI plugin", () => {
     expect(state.layers[0]?.bindings).toEqual([
       { key: "ctrl+b", cmd: "btw.history", desc: "BTW history" },
     ]);
+    expect(state.intercepts).toEqual([{ name: "key", priority: 20_000 }]);
     await Promise.all(state.disposed.map((fn) => fn()));
   });
 

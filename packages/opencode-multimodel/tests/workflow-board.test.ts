@@ -11,7 +11,12 @@ import {
   boardOverview,
   buildWorkflowBoardRun,
   chunkTasks,
+  executingBoardAgent,
+  formatWorkflowHeartbeat,
+  formatWorkflowIndicator,
   listWorkflowBoardRuns,
+  shouldEmitWorkflowHeartbeat,
+  workflowHeartbeatKey,
   nextBoardAgent,
   preferredBoardAgent,
   previousBoardAgent,
@@ -76,7 +81,13 @@ describe("workflow board tiles", () => {
   });
 
   test("shows the selected agent's executing prompt in the overview pane", () => {
-    const board = buildWorkflowBoardRun(run(), fleet, [{
+    const board = buildWorkflowBoardRun(run({
+      steps: [
+        { id: "understand", status: "running", memberID: "session" },
+        { id: "change", status: "pending", memberID: "codex" },
+        { id: "verify", status: "pending", memberID: "session" },
+      ],
+    }), fleet, [{
       stepID: "understand",
       memberID: "session",
       prompt: "Explore the repository",
@@ -87,6 +98,96 @@ describe("workflow board tiles", () => {
     expect(boardOverview(board, agent)).toContain("Executing:");
     expect(boardOverview(board, agent)).toContain("Explore the repository");
     expect(boardOverview(board)).toContain("Task:");
+  });
+
+  test("formats a bottom-of-CLI busy indicator and occasional heartbeats", () => {
+    expect(formatWorkflowIndicator([]).active).toBe(false);
+    const live = run({
+      updatedAt: 1_000,
+      steps: [
+        {
+          id: "understand",
+          status: "completed",
+          memberID: "session",
+        },
+        {
+          id: "change",
+          status: "running",
+          memberID: "session",
+          startedAt: 1_000,
+        },
+        { id: "verify", status: "pending", memberID: "session" },
+      ],
+    });
+    const indicator = formatWorkflowIndicator([live], 13_000);
+    expect(indicator.line).toBe(
+      "✻ Running dynamic · change/session · 12s",
+    );
+    expect(indicator.checklist).toBe(
+      "✓ understand   ● change session   ○ verify",
+    );
+    expect(formatWorkflowHeartbeat(live, 13_000)).toBe(
+      "dynamic still working · change · session · 12s",
+    );
+    expect(workflowHeartbeatKey(live)).toBe(`${live.id}:running:change:session`);
+    expect(shouldEmitWorkflowHeartbeat({
+      key: "a",
+      now: 20_000,
+    })).toBe(false);
+    expect(shouldEmitWorkflowHeartbeat({
+      previousKey: "a",
+      lastAt: 1_000,
+      key: "a",
+      now: 10_000,
+    })).toBe(false);
+    expect(shouldEmitWorkflowHeartbeat({
+      previousKey: "a",
+      lastAt: 1_000,
+      key: "a",
+      now: 22_000,
+    })).toBe(true);
+    expect(shouldEmitWorkflowHeartbeat({
+      previousKey: "a",
+      lastAt: 1_000,
+      key: "b",
+      now: 1_500,
+    })).toBe(true);
+  });
+
+  test("the executing pane follows the live seat, not a queued tile", () => {
+    const board = buildWorkflowBoardRun(run({
+      steps: [
+        {
+          id: "understand",
+          status: "completed",
+          memberID: "session",
+          output: "plan",
+        },
+        { id: "change", status: "running", memberID: "codex" },
+        { id: "verify", status: "pending", memberID: "session" },
+      ],
+    }), fleet, [{
+      stepID: "change",
+      memberID: "codex",
+      prompt: "Execute the plan",
+      status: "running",
+    }]);
+    expect(executingBoardAgent(board, "verify:session")?.stepID).toBe("change");
+    expect(executingBoardAgent(board, "understand:session")?.status).toBe(
+      "running",
+    );
+    const idle = buildWorkflowBoardRun(run({
+      status: "completed",
+      steps: [{
+        id: "understand",
+        status: "completed",
+        memberID: "session",
+        output: "done",
+      }],
+    }), fleet);
+    expect(executingBoardAgent(idle, "understand:session")?.stepID).toBe(
+      "understand",
+    );
   });
 
   test("lists active workflows before finished ones", () => {
@@ -140,6 +241,62 @@ describe("workflow board tiles", () => {
     }, { leadID: "lead", members: [] });
     expect(queued.tasks).toEqual([expect.objectContaining({ id: "queued" })]);
     expect(queued.tasks[0]?.agents[0]?.role).toBe("lead");
+  });
+
+  test("promotes a pending collaboration tile when its agent call is already running", () => {
+    const board = buildWorkflowBoardRun({
+      id: "collab_live",
+      kind: "collaboration",
+      definition: "orchestrate",
+      sessionID: "parent",
+      input: "Ship the adapter",
+      status: "running",
+      mode: "orchestrate",
+      participants: ["session", "codex"],
+      steps: [
+        { id: "session", status: "pending", memberID: "session" },
+        { id: "codex", status: "pending", memberID: "codex" },
+      ],
+      createdAt: 1,
+      updatedAt: 2,
+    }, fleet, [{
+      stepID: "session",
+      memberID: "session",
+      prompt: "Plan the TASKS block for the adapter",
+      status: "running",
+    }]);
+    expect(board.tasks[0]).toMatchObject({
+      status: "running",
+      agents: [{ status: "running", doing: "Plan the TASKS block for the adapter" }],
+    });
+    expect(board.tasks[1]?.status).toBe("pending");
+    expect(boardOverview(board)).toContain("Lead is planning");
+  });
+
+  test("shows cancelled instead of waiting after an aborted collaboration", () => {
+    const board = buildWorkflowBoardRun({
+      id: "collab_dead",
+      kind: "collaboration",
+      definition: "handoff",
+      sessionID: "parent",
+      input: "Implement the adapter",
+      status: "cancelled",
+      mode: "handoff",
+      participants: ["session", "codex"],
+      steps: [
+        {
+          id: "session",
+          status: "cancelled",
+          memberID: "session",
+          error: "Run cancelled by user.",
+        },
+        { id: "codex", status: "cancelled", memberID: "codex" },
+      ],
+      createdAt: 1,
+      updatedAt: 2,
+    }, fleet);
+    expect(board.tasks[0]?.agents[0]?.doing).toBe("Run cancelled by user.");
+    expect(board.tasks[1]?.agents[0]?.doing).toBe("Cancelled");
   });
 
   test("marks collaboration seats as lead or worker and inspects a worker", () => {

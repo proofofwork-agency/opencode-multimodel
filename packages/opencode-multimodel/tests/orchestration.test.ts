@@ -41,7 +41,11 @@ describe("durable run control", () => {
     await waitFor(async () => (await store.getRun(admitted.id))?.status === "cancelled");
 
     expect(cancelled).toContain(admitted.id);
-    expect((await store.getRun(admitted.id))?.status).toBe("cancelled");
+    const finished = await store.getRun(admitted.id);
+    expect(finished?.status).toBe("cancelled");
+    expect(finished?.steps.every((step) => step.status === "cancelled")).toBe(
+      true,
+    );
   });
 
   test("pauses DAG workflows only between agent calls and resumes in-process", async () => {

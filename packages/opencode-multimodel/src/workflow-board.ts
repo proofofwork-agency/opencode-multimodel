@@ -53,6 +53,94 @@ export function isActiveRunStatus(status: string) {
   return ACTIVE.has(status);
 }
 
+export const WORKFLOW_HEARTBEAT_MS = 20_000;
+
+export type WorkflowIndicator = {
+  line: string;
+  checklist: string;
+  active: boolean;
+  runID?: string;
+};
+
+export function formatWorkflowChecklist(run: DurableRun) {
+  if (run.steps.length === 0) return run.status;
+  return run.steps.map((step) => {
+    const mark = step.status === "completed"
+      ? "✓"
+      : step.status === "running"
+      ? "●"
+      : step.status === "failed"
+      ? "✗"
+      : step.status === "cancelled" || step.status === "interrupted"
+      ? "–"
+      : "○";
+    return step.status === "running"
+      ? `${mark} ${step.id} ${step.memberID}`
+      : `${mark} ${step.id}`;
+  }).join("   ");
+}
+
+export function formatWorkflowIndicator(
+  runs: DurableRun[],
+  now = Date.now(),
+): WorkflowIndicator {
+  const live = [...runs]
+    .filter((run) => isActiveRunStatus(run.status))
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+  if (live.length === 0) return { line: "", checklist: "", active: false };
+  const run = live[0]!;
+  const step = liveStep(run);
+  const elapsed = formatElapsed(now - (step?.startedAt ?? run.updatedAt));
+  const seat = step ? `${step.id}/${step.memberID}` : run.status;
+  const extra = live.length > 1 ? `  +${live.length - 1} more` : "";
+  return {
+    line: `✻ Running ${run.definition} · ${seat} · ${elapsed}${extra}`,
+    checklist: formatWorkflowChecklist(run),
+    active: true,
+    runID: run.id,
+  };
+}
+
+export function workflowHeartbeatKey(run: DurableRun) {
+  const step = liveStep(run);
+  return `${run.id}:${run.status}:${step?.id ?? ""}:${step?.memberID ?? ""}`;
+}
+
+export function formatWorkflowHeartbeat(run: DurableRun, now = Date.now()) {
+  const step = liveStep(run);
+  const elapsed = formatElapsed(now - (step?.startedAt ?? run.updatedAt));
+  if (step) {
+    return `${run.definition} still working · ${step.id} · ${step.memberID} · ${elapsed}`;
+  }
+  return `${run.definition} still ${run.status} · ${elapsed}`;
+}
+
+export function shouldEmitWorkflowHeartbeat(input: {
+  previousKey?: string;
+  lastAt?: number;
+  key: string;
+  now: number;
+  intervalMs?: number;
+}) {
+  if (!input.previousKey) return false;
+  if (input.previousKey !== input.key) return true;
+  return input.now - (input.lastAt ?? 0) >=
+    (input.intervalMs ?? WORKFLOW_HEARTBEAT_MS);
+}
+
+function liveStep(run: DurableRun) {
+  return run.steps.find((step) => step.status === "running") ??
+    run.steps.find((step) => step.status === "pending");
+}
+
+function formatElapsed(ms: number) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest === 0 ? `${minutes}m` : `${minutes}m ${rest}s`;
+}
+
 export function runLeadID(run: DurableRun, fleet: Fleet) {
   if (run.steps.some((step) => step.memberID === SESSION_MEMBER_ID)) {
     return SESSION_MEMBER_ID;
@@ -123,16 +211,29 @@ export function boardOverview(
   selected?: WorkflowBoardAgent,
 ) {
   if (!selected) return run.overview;
+  const live = selected.status === "running";
   return [
     `${selected.role.toUpperCase()} · ${selected.memberID} · ${selected.stepID}`,
     selected.model ? `model ${selected.model}` : undefined,
     `status ${selected.status}`,
     "",
-    "Executing:",
+    live ? "Executing:" : "Prompt:",
     selected.prompt || "(no prompt recorded)",
     selected.output ? `\nResult:\n${selected.output}` : undefined,
     selected.error ? `\nError:\n${selected.error}` : undefined,
   ].filter((line) => line !== undefined).join("\n");
+}
+
+export function executingBoardAgent(
+  run?: WorkflowBoardRun,
+  selectedKey?: string,
+) {
+  const live = preferredBoardAgent(run);
+  if (live?.status === "running") return live;
+  if (!run || !selectedKey) return live;
+  return run.tasks.flatMap((task) => task.agents).find((agent) =>
+    agent.key === selectedKey
+  ) ?? live;
 }
 
 export function firstBoardAgent(run?: WorkflowBoardRun) {
@@ -208,19 +309,24 @@ function taskFromStep(
   leadID: string,
   calls: AgentCallSnapshot[],
 ): WorkflowBoardTask {
-  const call = calls.find((item) => item.stepID === step.id) ??
+  const matching = calls.filter((item) =>
+    item.stepID === step.id ||
+    (!item.stepID && item.memberID === step.memberID)
+  );
+  const call = matching.at(-1) ??
     calls.find((item) => item.memberID === step.memberID);
+  const status = fresherStatus(call?.status, step.status);
   return {
     id: step.id,
     title: step.id,
-    status: step.status,
+    status,
     agents: [{
       key: `${step.id}:${step.memberID}`,
       stepID: step.id,
       memberID: step.memberID,
       role: step.memberID === leadID ? "lead" : "worker",
-      status: step.status,
-      doing: agentDoing(step, call),
+      status,
+      doing: agentDoing(step, call, status),
       prompt: call?.prompt ?? step.output ?? "",
       output: call?.output ?? step.output,
       error: call?.error ?? step.error,
@@ -246,27 +352,61 @@ function pendingTask(leadID: string): WorkflowBoardTask {
   };
 }
 
-function agentDoing(step: WorkflowStepRun, call?: AgentCallSnapshot) {
-  if (step.status === "running") {
-    return firstLine(call?.prompt) || "Working…";
+function agentDoing(
+  step: WorkflowStepRun,
+  call: AgentCallSnapshot | undefined,
+  status: string,
+) {
+  if (status === "running") {
+    return firstLine(call?.prompt) || firstLine(step.output) || "Working…";
   }
-  if (step.status === "completed") {
+  if (status === "completed") {
     return firstLine(call?.output ?? step.output) || "Done";
   }
-  if (step.status === "failed") {
+  if (status === "failed") {
     return firstLine(call?.error ?? step.error) || "Failed";
   }
-  if (step.status === "pending") return "Waiting";
-  if (step.status === "interrupted") return "Paused";
-  return step.status;
+  if (status === "cancelled" || status === "stopped") {
+    return firstLine(step.error) || "Cancelled";
+  }
+  if (status === "pending") return "Waiting";
+  if (status === "interrupted" || status === "paused") return "Paused";
+  return status;
+}
+
+function fresherStatus(callStatus: string | undefined, stepStatus: string) {
+  const rank: Record<string, number> = {
+    pending: 0,
+    queued: 0,
+    waiting: 0,
+    paused: 1,
+    interrupted: 1,
+    running: 2,
+    completed: 3,
+    failed: 3,
+    cancelled: 3,
+    stopped: 3,
+  };
+  if (!callStatus) return stepStatus;
+  return (rank[callStatus] ?? 0) >= (rank[stepStatus] ?? 0)
+    ? callStatus
+    : stepStatus;
 }
 
 function defaultOverview(run: DurableRun, leadID: string) {
   const done = run.steps.filter((step) => step.status === "completed").length;
+  const stalled = (run.status === "running" || run.status === "pending") &&
+    run.steps.length > 0 &&
+    run.steps.every((step) => step.status === "pending");
   return [
     `${run.definition} · ${run.status} · ${run.kind}`,
     `lead ${leadID} · ${done}/${run.steps.length} tasks`,
     run.input ? `\nTask:\n${run.input}` : undefined,
+    stalled
+      ? run.kind === "collaboration"
+        ? "\nLead is planning. Worker tiles stay queued until they are invoked."
+        : "\nAssigning seats and starting the first task…"
+      : undefined,
     run.final ? `\nReport:\n${run.final}` : undefined,
     run.error ? `\nError:\n${run.error}` : undefined,
   ].filter((line) => line !== undefined).join("\n");

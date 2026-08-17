@@ -225,7 +225,7 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
   )).toEqual([
     "xai/grok-4.6",
     "xai/grok-4.6",
-    "test/model",
+    "xai/grok-4.6",
     "xai/grok-4.6",
     "xai/grok-4.6",
   ]);
@@ -329,6 +329,15 @@ test("TUI plugin registers slash commands and dedicated routes", async () => {
         );
         return () => {};
       },
+      intercept() {
+        return () => {};
+      },
+    },
+    renderer: {
+      currentFocusedEditor: null,
+    },
+    ui: {
+      dialog: { open: false, clear() {} },
     },
     lifecycle: {
       signal: new AbortController().signal,

@@ -5,8 +5,10 @@ import { parseGoalCommand } from "./command.ts";
 import { isAbortError } from "./opencode.ts";
 import { parseOptions } from "./options.ts";
 import {
+  agentGoalSystemBlock,
   budgetLimitPrompt,
   continuationPrompt,
+  formatGoalReceipt,
   formatGoalStatus,
   startPrompt,
 } from "./prompts.ts";
@@ -20,6 +22,7 @@ const server: Plugin = async (input, rawOptions) => {
   const goals = createGoalService(input.directory, options, client, {
     baseUrl: input.serverUrl?.toString(),
   });
+  void goals.recoverActive().catch(() => undefined);
 
   return {
     async config(config) {
@@ -34,13 +37,27 @@ const server: Plugin = async (input, rawOptions) => {
       if (event.command !== "goal") return;
       try {
         const command = parseGoalCommand(event.arguments ?? "");
-        await goals.apply(event.sessionID, command, { start: false });
+        await goals.apply(event.sessionID, command, { start: false, steer: true });
+        if (command.action === "set" || command.action === "resume") {
+          await goals.takeOver(event.sessionID);
+        }
         const goal = goals.get(event.sessionID);
         const text = command.action === "set" && goal
           ? startPrompt(goal)
           : command.action === "resume" && goal?.status === "active"
           ? continuationPrompt(goal)
-          : formatGoalStatus(goal);
+          : command.action === "status"
+          ? formatGoalStatus(goal)
+          : formatGoalReceipt(
+            goal,
+            command.action === "pause"
+              ? "paused"
+              : command.action === "clear"
+              ? "cleared"
+              : command.action === "budget"
+              ? "budget"
+              : "updated",
+          );
         output.parts = [{ type: "text", text }] as typeof output.parts;
       } catch (error) {
         output.parts = [{
@@ -137,10 +154,16 @@ const server: Plugin = async (input, rawOptions) => {
         },
       }),
       get_goal: tool({
-        description: "Return the persisted thread goal, or null when none exists.",
+        description:
+          "Read the persisted thread goal for this session. Call this before planning or claiming progress whenever a /goal is active. Returns null when no goal exists.",
         args: {},
         async execute(_args, context) {
-          return JSON.stringify({ goal: goals.get(context.sessionID) ?? null });
+          const goal = goals.get(context.sessionID) ?? null;
+          return JSON.stringify({
+            goal,
+            active: goal?.status === "active",
+            contract: goal ? formatGoalStatus(goal) : "No persisted goal.",
+          });
         },
       }),
     },
@@ -157,7 +180,7 @@ const server: Plugin = async (input, rawOptions) => {
         return;
       }
       if (event.event.type === "session.created") {
-        await goals.handleResume(sessionID);
+        await goals.handleResume(sessionID).catch(() => undefined);
       }
     },
     async "chat.message"(input, output) {
@@ -172,9 +195,7 @@ const server: Plugin = async (input, rawOptions) => {
       if (!sessionID) return;
       const goal = goals.get(sessionID);
       if (!goal || goal.status !== "active") return;
-      output.system.push(
-        `Active persisted goal (${goal.status}): ${goal.objective}`,
-      );
+      output.system.push(agentGoalSystemBlock(goal));
     },
     async "experimental.session.compacting"(input, output) {
       const goal = goals.get(input.sessionID);

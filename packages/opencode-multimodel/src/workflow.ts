@@ -1,5 +1,4 @@
 import { mapLimit } from "./concurrency.ts";
-import { suggestMemberForStep } from "./dynamic.ts";
 import { collaborationSystem } from "./prompts.ts";
 import type {
   AgentRunner,
@@ -355,21 +354,8 @@ function nextWorkflowMember(
   step: WorkflowStep,
   tried: string[],
 ) {
-  if (tried.length === 0) {
-    if (!step.memberID) return workflowMember(fleet, lead, step);
-    const assigned = fleet.members.find((member) =>
-      member.id === step.memberID && member.enabled
-    );
-    if (assigned) return workflowMember(fleet, lead, step);
-  }
-  const exclude = [
-    ...tried,
-    ...(step.memberID && tried.length === 0 ? [step.memberID] : []),
-  ];
-  const pick = suggestMemberForStep(step, fleet, tried, exclude);
-  return pick
-    ? workflowMember(fleet, lead, { ...step, memberID: pick.id })
-    : undefined;
+  if (tried.length > 0) return undefined;
+  return workflowMember(fleet, lead, step);
 }
 
 function describeStepFailures(failures: string[], lastError: unknown) {

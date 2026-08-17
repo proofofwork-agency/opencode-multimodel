@@ -223,11 +223,7 @@ async function orchestrate(context: CollaborationContext) {
     "orchestrate plan",
   );
   const parsed = parseTasksBlock(plan.text).slice(0, MAX_TASKS);
-  const assignments = (
-    parsed.length
-      ? parsed
-      : [{ model: context.workers[0]!.id, prompt: context.prompt }]
-  )
+  const assignments = parsed
     .map((task) => ({
       task,
       member: resolveWorker(context.workers, task.model),
@@ -344,6 +340,7 @@ async function invoke(
       system: collaborationSystem(member, context.lead, context.participants),
       signal: context.options.signal,
       runID: context.options.runID,
+      stepID: member.id,
       callIndex,
     });
     context.replies.push(reply);

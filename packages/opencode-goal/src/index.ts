@@ -1,5 +1,11 @@
 export { parseGoalCommand, parseBudget, GoalCommandError } from "./command.ts";
 export type { GoalCommand } from "./command.ts";
+export {
+  goalSlashArguments,
+  sessionLooksBusy,
+  shouldStartGoalTurn,
+  shouldSteerLiveTurn,
+} from "./slash.ts";
 export { parseOptions, GoalConfigError } from "./options.ts";
 export type { GoalOptions } from "./options.ts";
 export { GoalStore, resolvePath } from "./store.ts";
@@ -16,7 +22,10 @@ export {
   startPrompt,
   goalContextBlock,
   formatGoalStatus,
+  formatGoalReceipt,
+  agentGoalSystemBlock,
   completionBudgetReport,
+  GOAL_RECEIPT_MARK,
 } from "./prompts.ts";
 export { multimodelRunGate, isCodexDelegateModel, delegatePrompt } from "./bridge.ts";
 export { adaptGoalClient, createdSessionID, httpJudge } from "./opencode.ts";

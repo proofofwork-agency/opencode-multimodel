@@ -19,6 +19,7 @@ import {
 import {
   defaultDynamicWorkflow,
   DYNAMIC_WORKFLOW_NAME,
+  parseWorkflowCommand,
 } from "./dynamic.ts";
 import {
   asOpenCodeClient,
@@ -40,16 +41,23 @@ import {
 import {
   adjacentBoardRun,
   boardOverview,
-  chunkTasks,
+  executingBoardAgent,
   firstBoardAgent,
+  formatWorkflowChecklist,
+  formatWorkflowHeartbeat,
+  formatWorkflowIndicator,
   nextBoardAgent,
   previousBoardAgent,
   resolveWorkflowBoard,
+  shouldEmitWorkflowHeartbeat,
+  workflowHeartbeatKey,
   type AgentCallSnapshot,
   type WorkflowBoardRun,
 } from "./workflow-board.ts";
 import { loadWorkflowDirectories } from "./workflow-files.ts";
+import { parseCollabCommand, parsePluginSlash } from "./slash.ts";
 
+const SUBMIT_PRIORITY = 20_000;
 const ROUTE_FLEET = "multimodel.fleet";
 const ROUTE_COLLAB = "multimodel.collab";
 const ROUTE_WORKFLOWS = "multimodel.workflows";
@@ -87,9 +95,11 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     (await store.read()).workflows,
   );
 
-  if (options.composer.enabled && api.slots) {
-    registerComposerInputRouting(api, options, composer);
-    registerComposerSlots(api, store, options, composer);
+  if (api.slots) {
+    registerHostSlots(api, store, options, composer);
+    if (options.composer.enabled) {
+      registerComposerInputRouting(api, options, composer);
+    }
   }
   watchBackgroundRuns(api, store, composer);
 
@@ -148,6 +158,41 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       ),
     },
   ]);
+
+  api.lifecycle.onDispose(interceptSlashSubmit(api, (text) => {
+    const active = composer.ref(api.route.current);
+    const source = {
+      ...(active?.current ?? { input: text, mode: "normal" as const, parts: [] }),
+      input: text,
+    };
+    const routed = options.composer.enabled
+      ? routeComposerPrompt(
+        source,
+        composer.selection(),
+        options.composer.autoRoute,
+        composer.workflows(),
+        options.defaultMode,
+      )
+      : source;
+    const parsed = parsePluginSlash(routed.input);
+    if (!parsed) return false;
+    if (parsed.kind === "workflows") {
+      api.route.navigate(ROUTE_WORKFLOWS, {
+        returnRoute: api.route.current,
+      });
+      api.ui.dialog.clear();
+      return true;
+    }
+    if (parsed.kind === "workflow") {
+      void handleWorkflowSlash(api, store, composer, parsed.args).catch(
+        (error) => toast(api, message(error), "error"),
+      );
+      return true;
+    }
+    void handleCollabSlash(api, store, composer, options, runs, parsed.args)
+      .catch((error) => toast(api, message(error), "error"));
+    return true;
+  }));
 
   api.keymap.registerLayer({
     commands: [
@@ -431,7 +476,6 @@ function CollabScreen(
     options: MultiModelOptions;
   },
 ) {
-  const controller = new AbortController();
   const [activity, setActivity] = createSignal<Record<string, CollabActivity>>(
     {},
   );
@@ -445,13 +489,12 @@ function CollabScreen(
       sessionID,
       prompt,
       mode,
-      signal: controller.signal,
+      background: true,
       onActivity(event) {
         setActivity((current) => ({ ...current, [event.memberID]: event }));
       },
     });
   });
-  onCleanup(() => controller.abort());
   useBackKey(props.api, props.params);
   return (
     <Screen
@@ -615,18 +658,13 @@ function WorkflowBoardView(props: {
 }) {
   const selected = () =>
     props.runs.find((run) => run.id === props.selectedRunID) ?? props.runs[0];
-  const selectedAgent = () => {
-    const run = selected();
-    if (!run) return undefined;
-    return run.tasks.flatMap((task) => task.agents).find((agent) =>
-      agent.key === props.selectedAgentKey
-    );
-  };
   const theme = () => props.api.theme.current;
+  const focused = () => executingBoardAgent(selected(), props.selectedAgentKey);
+  const live = () => focused()?.status === "running";
   return (
     <box flexDirection="row" flexGrow={1} minHeight={0} gap={1}>
       <box
-        width={26}
+        width={22}
         flexDirection="column"
         gap={1}
         border
@@ -665,11 +703,16 @@ function WorkflowBoardView(props: {
           </For>
         </Show>
       </box>
-      <box flexGrow={1} minWidth={0} flexDirection="column" gap={1}>
-        <text fg={theme().accent}>
+      <box
+        width={30}
+        flexDirection="column"
+        gap={1}
+        minHeight={0}
+      >
+        <text fg={theme().textMuted}>
           TASKS
           {selected()
-            ? ` · ${selected()!.name} · lead ${selected()!.leadID}`
+            ? ` · ${selected()!.name}`
             : ""}
         </text>
         <Show
@@ -678,78 +721,79 @@ function WorkflowBoardView(props: {
             <text fg={theme().textMuted}>Select a workflow on the left.</text>
           }
         >
-          <For each={chunkTasks(selected()!.tasks)}>
-            {(row) => (
-              <box flexDirection="row" gap={1} flexGrow={1} minHeight={8}>
-                <For each={row}>
-                  {(task) => (
-                    <box
-                      flexGrow={1}
-                      minWidth={0}
-                      flexDirection="column"
-                      gap={1}
-                      border
-                      borderStyle="rounded"
-                      borderColor={task.agents.some((agent) =>
-                          agent.key === props.selectedAgentKey
-                        )
-                        ? theme().accent
-                        : theme().textMuted}
-                      padding={1}
-                    >
-                      <text fg={runColor(props.api, task.status)}>
-                        {task.title} · {task.status}
-                      </text>
-                      <For each={task.agents}>
-                        {(agent) => (
-                          <box
-                            flexDirection="column"
-                            paddingLeft={1}
-                            paddingRight={1}
-                            backgroundColor={agent.key === props.selectedAgentKey
-                              ? theme().backgroundElement
-                              : undefined}
-                            onMouseUp={() => props.onSelectAgent(agent.key)}
-                          >
-                            <text
-                              fg={agent.role === "lead"
-                                ? theme().accent
-                                : theme().info}
-                            >
-                              {agent.role === "lead" ? "LEAD" : "WORK"}{" "}
-                              {agent.memberID}
-                            </text>
-                            <text fg={runColor(props.api, agent.status)}>
-                              {agent.status} · {agent.doing}
-                            </text>
-                          </box>
-                        )}
-                      </For>
-                    </box>
-                  )}
-                </For>
-              </box>
-            )}
-          </For>
+          <box flexDirection="column" gap={1} flexGrow={1} minHeight={0}>
+            <For each={selected()!.tasks}>
+              {(task) => (
+                <box
+                  flexDirection="column"
+                  border
+                  borderStyle="rounded"
+                  borderColor={task.agents.some((agent) =>
+                      agent.key === focused()?.key
+                    )
+                    ? theme().accent
+                    : theme().textMuted}
+                  padding={1}
+                >
+                  <text fg={runColor(props.api, task.status)}>
+                    {task.title} · {task.status}
+                  </text>
+                  <For each={task.agents}>
+                    {(agent) => (
+                      <box
+                        flexDirection="column"
+                        paddingLeft={1}
+                        paddingRight={1}
+                        backgroundColor={agent.key === focused()?.key
+                          ? theme().backgroundElement
+                          : undefined}
+                        onMouseUp={() => props.onSelectAgent(agent.key)}
+                      >
+                        <text
+                          fg={agent.role === "lead"
+                            ? theme().accent
+                            : theme().info}
+                        >
+                          {agent.role === "lead" ? "LEAD" : "WORK"}{" "}
+                          {agent.memberID}
+                        </text>
+                        <text fg={runColor(props.api, agent.status)}>
+                          {agent.status} · {agent.doing}
+                        </text>
+                      </box>
+                    )}
+                  </For>
+                </box>
+              )}
+            </For>
+          </box>
         </Show>
       </box>
       <box
-        width={36}
+        flexGrow={1}
+        minWidth={40}
+        minHeight={0}
         flexDirection="column"
         gap={1}
         border
         borderStyle="single"
-        borderColor={theme().textMuted}
+        borderColor={live() ? theme().accent : theme().textMuted}
         padding={1}
       >
-        <text fg={theme().accent}>
-          {selectedAgent() ? "EXECUTING" : "OVERVIEW"}
+        <text fg={live() ? theme().accent : theme().textMuted}>
+          {focused()
+            ? live()
+              ? `EXECUTING · ${focused()!.stepID} · ${focused()!.memberID}`
+              : `INSPECT · ${focused()!.stepID} · ${focused()!.status}`
+            : "OVERVIEW"}
         </text>
-        <text fg={theme().text} wrapMode="word">
-          {selected()
-            ? boardOverview(selected()!, selectedAgent())
-            : "Workflow reports land here. Click an agent tile to inspect the prompt and result."}
-        </text>
+        <box flexGrow={1} minHeight={0}>
+          <text fg={theme().text} wrapMode="word">
+            {selected()
+              ? boardOverview(selected()!, focused())
+              : "The prompt and output of the seat that is working land here."}
+          </text>
+        </box>
       </box>
     </box>
   );
@@ -1058,7 +1102,7 @@ export function isPlainComposerSubmitKey(event: {
     !event.ctrl && !event.meta && !event.shift && !event.option;
 }
 
-function registerComposerSlots(
+function registerHostSlots(
   api: TuiPluginApi,
   store: StateStore,
   options: MultiModelOptions,
@@ -1066,36 +1110,58 @@ function registerComposerSlots(
 ) {
   api.slots.register({
     slots: {
-      home_prompt(_context, props) {
-        return (
-          <NativeComposer
-            api={api}
-            store={store}
-            options={options}
-            controller={controller}
-            sessionID="__home__"
-            hostRef={props.ref}
-            rightSlot="home_prompt_right"
-          />
-        );
+      app_bottom() {
+        return <WorkflowStatusBar api={api} store={store} />;
       },
-      session_prompt(_context, props) {
-        return (
-          <NativeComposer
-            api={api}
-            store={store}
-            options={options}
-            controller={controller}
-            sessionID={props.session_id}
-            visible={props.visible}
-            disabled={props.disabled}
-            onSubmit={props.on_submit}
-            hostRef={props.ref}
-            rightSlot="session_prompt_right"
-          />
-        );
+      home_bottom() {
+        return <WorkflowStatusBar api={api} store={store} />;
       },
-      sidebar_content(_context, props) {
+      ...(options.composer.enabled
+        ? {
+          home_prompt(
+            _context: unknown,
+            props: { ref?: (ref: TuiPromptRef | undefined) => void },
+          ) {
+            return (
+              <NativeComposer
+                api={api}
+                store={store}
+                options={options}
+                controller={controller}
+                sessionID="__home__"
+                hostRef={props.ref}
+                rightSlot="home_prompt_right"
+              />
+            );
+          },
+          session_prompt(
+            _context: unknown,
+            props: {
+              session_id: string;
+              visible?: boolean;
+              disabled?: boolean;
+              on_submit?: () => void;
+              ref?: (ref: TuiPromptRef | undefined) => void;
+            },
+          ) {
+            return (
+              <NativeComposer
+                api={api}
+                store={store}
+                options={options}
+                controller={controller}
+                sessionID={props.session_id}
+                visible={props.visible}
+                disabled={props.disabled}
+                onSubmit={props.on_submit}
+                hostRef={props.ref}
+                rightSlot="session_prompt_right"
+              />
+            );
+          },
+        }
+        : {}),
+      sidebar_content(_context: unknown, props: { session_id: string }) {
         return (
           <SidebarStatus api={api} store={store} sessionID={props.session_id} />
         );
@@ -1179,6 +1245,7 @@ function NativeComposer(props: {
         props.controller.setSessionID(props.sessionID);
         props.hostRef?.(value);
       }}
+      hint={<WorkflowPromptHint api={props.api} store={props.store} sessionID={props.sessionID} />}
       right={
         <box flexDirection="row" gap={1}>
           {props.rightSlot === "session_prompt_right"
@@ -1383,6 +1450,7 @@ function watchBackgroundRuns(
   composer: ComposerController,
 ) {
   const seen = new Map<string, string>();
+  const heartbeats = new Map<string, { key: string; at: number }>();
   const watchingSince = Date.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
@@ -1390,8 +1458,42 @@ function watchBackgroundRuns(
     if (disposed || api.lifecycle.signal.aborted) return;
     const state = await store.read();
     composer.setWorkflows(state.workflows);
-    const runs = state.runs.filter((run) => run.background);
-    await Promise.all(runs.map(async (run) => {
+    const now = Date.now();
+    const live = state.runs.filter((run) => isActiveStatus(run.status));
+    const background = state.runs.filter((run) => run.background);
+    await Promise.all(live.map(async (run) => {
+      const key = workflowHeartbeatKey(run);
+      const previous = heartbeats.get(run.id);
+      if (
+        !shouldEmitWorkflowHeartbeat({
+          previousKey: previous?.key,
+          lastAt: previous?.at,
+          key,
+          now,
+        })
+      ) {
+        if (!previous) heartbeats.set(run.id, { key, at: now });
+        return;
+      }
+      heartbeats.set(run.id, { key, at: now });
+      const message = formatWorkflowHeartbeat(run, now);
+      api.ui.toast({
+        title: "Workflow",
+        message,
+        variant: "info",
+        duration: 8_000,
+      });
+      await api.attention.notify({
+        title: "Workflow still working",
+        message,
+        sound: false,
+        notification: false,
+      });
+    }));
+    for (const id of [...heartbeats.keys()]) {
+      if (!live.some((run) => run.id === id)) heartbeats.delete(id);
+    }
+    await Promise.all(background.map(async (run) => {
       const previous = seen.get(run.id);
       seen.set(run.id, run.status);
       const newlyCompleted = !previous && run.createdAt >= watchingSince &&
@@ -1409,7 +1511,7 @@ function watchBackgroundRuns(
     if (disposed || api.lifecycle.signal.aborted) return;
     timer = setTimeout(
       () => void poll(),
-      runs.some((run) => isActiveStatus(run.status)) ? 500 : 2_000,
+      live.length > 0 ? 500 : 2_000,
     );
   };
   void poll();
@@ -1442,6 +1544,60 @@ function usePollingState(store: StateStore) {
   return state;
 }
 
+function WorkflowStatusBar(props: {
+  api: TuiPluginApi;
+  store: StateStore;
+}) {
+  const state = usePollingState(props.store);
+  const indicator = () => formatWorkflowIndicator(state()?.runs ?? []);
+  return (
+    <Show when={indicator().active}>
+      <box
+        flexDirection="column"
+        paddingLeft={1}
+        paddingRight={1}
+        backgroundColor={props.api.theme.current.backgroundElement}
+        onMouseUp={() =>
+          props.api.route.navigate(ROUTE_WORKFLOWS, {
+            runID: indicator().runID,
+            returnRoute: props.api.route.current,
+          })}
+      >
+        <text fg={props.api.theme.current.accent}>{indicator().line}</text>
+        <Show when={indicator().checklist}>
+          <text fg={props.api.theme.current.textMuted}>
+            {indicator().checklist}   /workflows
+          </text>
+        </Show>
+      </box>
+    </Show>
+  );
+}
+
+function WorkflowPromptHint(props: {
+  api: TuiPluginApi;
+  store: StateStore;
+  sessionID: string;
+}) {
+  const state = usePollingState(props.store);
+  const indicator = () => {
+    const runs = (state()?.runs ?? []).filter((run) =>
+      props.sessionID === "__home__" || run.sessionID === props.sessionID
+    );
+    return formatWorkflowIndicator(runs);
+  };
+  return (
+    <Show when={indicator().active}>
+      <box flexDirection="column">
+        <text fg={props.api.theme.current.accent}>{indicator().line}</text>
+        <Show when={indicator().checklist}>
+          <text fg={props.api.theme.current.textMuted}>{indicator().checklist}</text>
+        </Show>
+      </box>
+    </Show>
+  );
+}
+
 function SidebarStatus(props: {
   api: TuiPluginApi;
   store: StateStore;
@@ -1460,9 +1616,14 @@ function SidebarStatus(props: {
             run.sessionID === props.sessionID && isActiveStatus(run.status)
           )}>
             {(run) => (
-              <text fg={props.api.theme.current.info}>
-                {run.definition} · {run.status}
-              </text>
+              <box flexDirection="column">
+                <text fg={props.api.theme.current.accent}>
+                  ✻ {run.definition} · {run.status}
+                </text>
+                <text fg={props.api.theme.current.textMuted}>
+                  {formatWorkflowChecklist(run)}
+                </text>
+              </box>
             )}
           </For>
         </box>
@@ -1810,6 +1971,130 @@ async function selectCollaboration(
 
 export function collaborationComposerInput(mode: CollabMode) {
   return `/collab ${mode} `;
+}
+
+async function handleCollabSlash(
+  api: TuiPluginApi,
+  store: StateStore,
+  composer: ComposerController,
+  options: MultiModelOptions,
+  runs: RunService,
+  args: string,
+) {
+  const parsed = parseCollabCommand(args, "orchestrate");
+  if (!parsed.prompt) {
+    if (!args) {
+      await selectCollaboration(api, store, options, composer);
+      return;
+    }
+    askForInput(
+      api,
+      `${parsed.mode} prompt`,
+      "What should the team do?",
+      (input) => startCollabAndOpenBoard(api, store, runs, parsed.mode, input),
+    );
+    return;
+  }
+  await startCollabAndOpenBoard(api, store, runs, parsed.mode, parsed.prompt);
+}
+
+async function startCollabAndOpenBoard(
+  api: TuiPluginApi,
+  store: StateStore,
+  runs: RunService,
+  mode: CollabMode,
+  prompt: string,
+) {
+  const state = await store.read();
+  if (state.fleet.members.length === 0) {
+    toast(api, "Fleet is empty. Add a model with /fleet first.", "warning");
+    return;
+  }
+  const sessionID = await parentSession(api);
+  const admitted = await runs.startCollaboration({
+    sessionID,
+    prompt,
+    mode,
+    background: true,
+  });
+  toast(api, `Started ${mode} · ${admitted.id}`, "success");
+  api.route.navigate(ROUTE_WORKFLOWS, {
+    runID: admitted.id,
+    returnRoute: api.route.current,
+  });
+  api.ui.dialog.clear();
+}
+
+function message(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function handleWorkflowSlash(
+  api: TuiPluginApi,
+  store: StateStore,
+  composer: ComposerController,
+  args: string,
+) {
+  if (!args) {
+    await selectWorkflow(api, store, composer);
+    return;
+  }
+  const state = await store.read();
+  const parsed = parseWorkflowCommand(args, state.workflows);
+  const definition = parsed.name
+    ? state.workflows.find((workflow) => workflow.name === parsed.name)
+    : undefined;
+  if (
+    definition &&
+    (definition.kind === "script" || definition.kind === "module")
+  ) {
+    const prompt = composer.ref(api.route.current);
+    if (!prompt) {
+      toast(
+        api,
+        `Use /workflow ${definition.name} from the session composer so OpenCode can request permission.`,
+        "warning",
+      );
+      return;
+    }
+    prompt.set({
+      ...prompt.current,
+      input: `/workflow ${args}`,
+    });
+    prompt.submit();
+    return;
+  }
+  const sessionID = await parentSession(api);
+  api.route.navigate(ROUTE_WORKFLOW, {
+    name: definition?.name ?? DYNAMIC_WORKFLOW_NAME,
+    input: parsed.dynamic ? parsed.input || args : parsed.input,
+    sessionID,
+    returnRoute: api.route.current,
+  });
+}
+
+function interceptSlashSubmit(
+  api: TuiPluginApi,
+  handle: (text: string) => boolean,
+) {
+  return api.keymap.intercept("key", (ctx) => {
+    if (!isSubmitKey(ctx.event) || api.ui.dialog.open) return;
+    const editor = api.renderer.currentFocusedEditor;
+    if (!editor) return;
+    if (!handle(editor.plainText)) return;
+    ctx.consume();
+    editor.clear();
+  }, { priority: SUBMIT_PRIORITY });
+}
+
+function isSubmitKey(event: {
+  name: string;
+  ctrl?: boolean;
+  meta?: boolean;
+  shift?: boolean;
+}) {
+  return (event.name === "return" || event.name === "enter") &&
+    !event.ctrl && !event.meta && !event.shift;
 }
 
 async function selectWorkflow(

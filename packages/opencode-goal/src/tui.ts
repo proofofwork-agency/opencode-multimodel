@@ -1,7 +1,14 @@
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
+import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
+import { parseGoalCommand } from "./command.ts";
 import { createGoalService } from "./engine.ts";
 import { parseOptions } from "./options.ts";
 import { formatGoalStatus } from "./prompts.ts";
+import {
+  goalSlashArguments,
+  shouldStartGoalTurn,
+} from "./slash.ts";
+
+const SUBMIT_PRIORITY = 20_000;
 
 const tui: TuiPlugin = async (api, rawOptions) => {
   const options = parseOptions(rawOptions);
@@ -22,11 +29,55 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     message: string,
     variant: "info" | "success" | "warning" | "error" = "info",
   ) => {
-    api.ui.toast({ title: "Goal", message, variant });
+    api.ui.toast({ title: "Goal", message, variant, duration: 12_000 });
   };
+
+  const applyFromSlash = async (raw: string) => {
+    const id = sessionID();
+    if (!id) return notify("Open a session before using /goal.", "warning");
+    try {
+      const command = parseGoalCommand(raw);
+      const start = shouldStartGoalTurn(command.action);
+      const message = await goals.apply(id, command, { start, steer: true });
+      notify(
+        message,
+        command.action === "set" || command.action === "resume" ? "success" : "info",
+      );
+      if (command.action === "set" || command.action === "resume") {
+        void api.attention.notify({
+          title: "Goal is steering this session",
+          message: goals.get(id)?.objective ?? "Thread goal updated.",
+        });
+      }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : String(error), "error");
+    }
+  };
+
+  api.lifecycle.onDispose(interceptSlashSubmit(api, {
+    match: goalSlashArguments,
+    onMatch: (args) => {
+      void applyFromSlash(args);
+    },
+  }));
 
   api.keymap.registerLayer({
     commands: [
+      {
+        name: "goal.run",
+        title: "Goal",
+        description:
+          "Set or manage the persisted thread goal immediately, without queuing",
+        category: "Goal",
+        namespace: "palette",
+        slashName: "goal",
+        run(ctx) {
+          const input = ctx as { input?: unknown };
+          void applyFromSlash(
+            typeof input.input === "string" ? input.input : "",
+          );
+        },
+      },
       {
         name: "goal.status",
         title: "Goal status",
@@ -101,6 +152,35 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     goals.close();
   });
 };
+
+function interceptSlashSubmit(
+  api: TuiPluginApi,
+  handler: {
+    match: (text: string) => string | undefined;
+    onMatch: (args: string) => void;
+  },
+) {
+  return api.keymap.intercept("key", (ctx) => {
+    if (!isSubmitKey(ctx.event) || api.ui.dialog.open) return;
+    const editor = api.renderer.currentFocusedEditor;
+    if (!editor) return;
+    const args = handler.match(editor.plainText);
+    if (args === undefined) return;
+    ctx.consume();
+    editor.clear();
+    handler.onMatch(args);
+  }, { priority: SUBMIT_PRIORITY });
+}
+
+function isSubmitKey(event: {
+  name: string;
+  ctrl?: boolean;
+  meta?: boolean;
+  shift?: boolean;
+}) {
+  return (event.name === "return" || event.name === "enter") &&
+    !event.ctrl && !event.meta && !event.shift;
+}
 
 export default {
   id: "opencode-goal",

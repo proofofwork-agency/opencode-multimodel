@@ -183,6 +183,23 @@ describe("Poly-derived collaboration modes", () => {
     expect(result.final.text).toBe("orchestrated final");
   });
 
+  test("orchestrate does not start a worker unless the lead names one", async () => {
+    const runner = new FakeRunner((input, index) => {
+      if (index === 0) return "I will handle this myself. No TASKS.";
+      return "lead-only final";
+    });
+    const result = await collaborate(runner, fleet, "parent", "Build it", {
+      mode: "orchestrate",
+    });
+
+    expect(runner.calls.map((call) => call.member.id)).toEqual([
+      "lead",
+      "lead",
+    ]);
+    expect(result.participants).toEqual(["lead"]);
+    expect(result.final.text).toBe("lead-only final");
+  });
+
   test("enforces a hard agent-call budget", async () => {
     const runner = new FakeRunner();
     await expect(

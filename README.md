@@ -1,6 +1,6 @@
 # OpenCode packages
 
-This repository is the Proof of Work OpenCode monorepo. It contains four independent public packages:
+This repository is the Proof of Work OpenCode monorepo. It contains independent public packages:
 
 Current prerelease: **`0.2.0-alpha.0`** for all packages. The alpha has
 been built and exercised against OpenCode **1.18.15**. Keep the npm `alpha`

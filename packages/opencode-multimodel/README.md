@@ -32,10 +32,14 @@ only OpenCode's public plugin and SDK APIs.
   `WORKFLOW` without replacing OpenCode's native prompt implementation.
   `WORKFLOW` uses the current session model by default, not the fleet's
   provider default.
-- `/workflows` is a nested tile board: active runs on the left, task tiles
-  with LEAD/WORK agents in the center, and a free-text overview on the right.
-  Click an agent to inspect the prompt it is executing. `/runs` and `/graph`
-  still expose the ledger and fleet routing.
+- `/workflows` is a nested board: active runs on the left, compact task
+  tiles next to them, and the executing prompt/result as the main pane.
+  That pane always follows the seat that is working. The session composer
+  shows a Claude-style running line and checklist
+  (`✻ Running dynamic · change/session · 48s` / `✓ understand ● change ○ verify`)
+  at the bottom of the chat. A toast still reports step changes and a
+  heartbeat every ~20s. `/runs` and `/graph` still expose the ledger and
+  fleet routing.
 - Server tools provide explicit fleet, collaboration, run-control, and
   workflow capabilities in API/headless OpenCode sessions.
 
@@ -76,7 +80,9 @@ Install the alpha channel from npm:
 }
 ```
 
-OpenCode loads the package's separate `./server` and `./tui` exports. The server entry registers tools and command templates; the TUI entry registers slash commands and additional screens.
+OpenCode loads the package's separate `./server` and `./tui` exports. The server entry registers tools and command templates; the TUI entry registers slash commands and additional screens. Put the same spec in `tui.json` as well as `opencode.json`.
+
+In the TUI, `/workflow`, `/workflows`, and `/collab` run immediately. TEAM and WORKFLOW composer modes start the same way. They do not join the busy-session prompt queue or wait for the session model to call a tool. `/workflows` opens the board. `/workflow` opens the picker, `/workflow <task>` or `/workflow <name> <input>` starts a run, and `/collab <mode> <task>` starts a background collaboration then opens the board. Script and TypeScript workflows still go through the composer so OpenCode can request permission.
 
 On first use, the plugin creates `.opencode/multimodel.sqlite` with SQLite WAL,
 a busy timeout, transactions, and file mode `0600`. It adds one default model
@@ -176,11 +182,13 @@ was discovered with). Saved named workflows remain available.
 <input>` still runs a saved definition when `name` matches exactly.
 
 Add models with `/fleet` or `/workflow-fleet`. Any enabled seat can take any
-step. Unassigned steps are auto-routed by task kind (explore / implement /
-review): for example a Codex delegate is preferred for change/code, the lead
-for understand/plan, and an independent seat for verify. The lead then
-reviews that plan and can remap any unassigned step onto any fleet model.
-A step that already names a `memberID` keeps it. Synthesis stays on the lead.
+step, but only after the lead assigns it. Unassigned steps stay on the current
+session model. The lead can remap a step onto any fleet seat; a step that
+already names a `memberID` keeps it. Synthesis stays on the lead.
+
+Unassigned steps stay on the lead. A worker starts only when the lead names
+that seat in an `ASSIGN` block. Failed or hung seats do not hop to another
+fleet member.
 
 `kind: "dag"` workflows are safe JSON dependency graphs. The `kind` may be
 omitted for compatibility with definitions saved by `0.1.x`.

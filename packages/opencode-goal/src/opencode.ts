@@ -22,6 +22,7 @@ export type GoalClient = {
   prompt(input: {
     sessionID: string;
     text: string;
+    noReply?: boolean;
   }): Promise<{ text: string; hadTools: boolean; tokens: number }>;
   messages?(sessionID: string): Promise<SessionTurn[]>;
   session?(sessionID: string): Promise<{
@@ -37,6 +38,7 @@ export type GoalClient = {
     prompt: string,
     options?: { model?: { id: string; providerID: string; variant?: string } },
   ): Promise<string>;
+  abort?(sessionID: string): Promise<void>;
 };
 
 type ClientResponse<Data> = {
@@ -73,8 +75,9 @@ export function adaptGoalClient(
 ): GoalClient {
   const typed = client as PluginSessionClient;
   return {
-    async prompt({ sessionID, text }) {
+    async prompt({ sessionID, text, noReply }) {
       const response = await typed.session.prompt(legacyOrPath(sessionID, {
+        noReply: noReply === true,
         parts: [{ type: "text", text }],
       }));
       if (response.error) {
@@ -130,6 +133,11 @@ export function adaptGoalClient(
       return response.data && typeof response.data === "object"
         ? response.data
         : {};
+    },
+    async abort(sessionID) {
+      const abort = bind(typed.session, "abort");
+      if (!abort) return;
+      await abort(pathOnly(sessionID));
     },
     async judge(prompt, options) {
       if (transport.baseUrl) {
@@ -199,6 +207,9 @@ export function childrenAreBusy(
 
 export function isGoalRuntimePrompt(text: string) {
   return text.includes("<untrusted_objective>") ||
+    text.includes("<opencode_goal_receipt>") ||
+    text.startsWith("PERSISTED THREAD GOAL") ||
+    text.startsWith("Continue working toward the persisted thread goal.") ||
     text.startsWith("Continue working toward the active thread goal.") ||
     text.startsWith("A persisted thread goal is now active.") ||
     text.startsWith("The active thread goal has reached its token budget.");

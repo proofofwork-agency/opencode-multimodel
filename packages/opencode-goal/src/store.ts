@@ -26,6 +26,7 @@ type GoalRow = {
   last_verdict_at: number | null;
   no_tool_streak: number;
   last_prompt_kind: Goal["lastPromptKind"] | null;
+  steer_until: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -223,8 +224,8 @@ export class GoalStore {
         checks_json, token_budget, tokens_used, time_used_seconds, turns,
         last_had_tools, continuation_suppressed, no_tool_streak, pause_reason,
         last_evidence, blocker, last_verdict, last_verdict_reason,
-        last_verdict_at, last_prompt_kind, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_verdict_at, last_prompt_kind, steer_until, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_id) DO UPDATE SET
         goal_id = excluded.goal_id,
         objective = excluded.objective,
@@ -246,6 +247,7 @@ export class GoalStore {
         last_verdict_reason = excluded.last_verdict_reason,
         last_verdict_at = excluded.last_verdict_at,
         last_prompt_kind = excluded.last_prompt_kind,
+        steer_until = excluded.steer_until,
         created_at = excluded.created_at,
         updated_at = excluded.updated_at`,
     ).run(
@@ -270,6 +272,7 @@ export class GoalStore {
       goal.lastVerdict?.reason ?? null,
       goal.lastVerdict?.at ?? null,
       goal.lastPromptKind ?? null,
+      goal.steerUntil ?? null,
       goal.createdAt,
       goal.updatedAt,
     );
@@ -311,6 +314,7 @@ export class GoalStore {
       "last_verdict",
       "last_verdict_reason",
       "last_verdict_at",
+      "steer_until",
     ];
     for (const column of needed) {
       if (columns.has(column)) continue;
@@ -318,9 +322,9 @@ export class GoalStore {
         this.database.exec(
           "ALTER TABLE thread_goals ADD COLUMN no_tool_streak INTEGER NOT NULL DEFAULT 0",
         );
-      } else if (column === "last_verdict_at") {
+      } else if (column === "last_verdict_at" || column === "steer_until") {
         this.database.exec(
-          "ALTER TABLE thread_goals ADD COLUMN last_verdict_at INTEGER",
+          `ALTER TABLE thread_goals ADD COLUMN ${column} INTEGER`,
         );
       } else {
         this.database.exec(`ALTER TABLE thread_goals ADD COLUMN ${column} TEXT`);
@@ -381,6 +385,7 @@ const GOALS_DDL = `
         last_verdict_reason TEXT,
         last_verdict_at INTEGER,
         last_prompt_kind TEXT,
+        steer_until INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
@@ -411,6 +416,7 @@ function hydrate(row: GoalRow): Goal {
     blocker: row.blocker ?? undefined,
     lastVerdict: hydrateVerdict(row),
     lastPromptKind: row.last_prompt_kind ?? undefined,
+    steerUntil: row.steer_until ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

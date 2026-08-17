@@ -29,6 +29,7 @@ import {
   budgetLimitPrompt,
   completionBudgetReport,
   continuationPrompt,
+  formatGoalReceipt,
   formatGoalStatus,
   startPrompt,
 } from "./prompts.ts";
@@ -94,7 +95,7 @@ export class GoalService {
   async apply(
     sessionID: string,
     command: GoalCommand,
-    options: { start?: boolean } = {},
+    options: { start?: boolean; steer?: boolean } = {},
   ) {
     if (command.action === "status") {
       return formatGoalStatus(this.store.get(sessionID));
@@ -103,7 +104,7 @@ export class GoalService {
       this.store.clear(sessionID);
       this.snapshots.remove(sessionID);
       this.humanTurns.delete(sessionID);
-      return "Goal cleared.";
+      return formatGoalReceipt(undefined, "cleared");
     }
     if (command.action === "pause") {
       const goal = requireGoal(this.store.get(sessionID));
@@ -114,7 +115,7 @@ export class GoalService {
           continuationSuppressed: false,
         }),
       );
-      return formatGoalStatus(next);
+      return formatGoalReceipt(next, "paused");
     }
     if (command.action === "resume") {
       const goal = requireGoal(this.store.get(sessionID));
@@ -132,8 +133,11 @@ export class GoalService {
           blocker: undefined,
         }),
       );
-      if (options.start !== false) await this.prompt(next, "continuation");
-      return formatGoalStatus(this.store.get(sessionID) ?? next);
+      if (options.start !== false) {
+        await this.takeOver(sessionID, options.steer !== false);
+        await this.prompt(next, "continuation");
+      }
+      return formatGoalReceipt(this.store.get(sessionID) ?? next, "resumed");
     }
     if (command.action === "budget") {
       const goal = requireGoal(this.store.get(sessionID));
@@ -142,7 +146,7 @@ export class GoalService {
           tokenBudget: command.tokenBudget,
         }),
       );
-      return formatGoalStatus(next);
+      return formatGoalReceipt(next, "budget");
     }
     const current = this.store.get(sessionID);
     if (current && sameObjective(current.objective, command.objective)) {
@@ -154,7 +158,11 @@ export class GoalService {
           checks: command.checks.length > 0 ? command.checks : current.checks,
         }),
       );
-      return formatGoalStatus(next);
+      if (options.start !== false) {
+        await this.takeOver(sessionID, options.steer !== false);
+        await this.prompt(next, "start");
+      }
+      return formatGoalReceipt(next, "updated");
     }
     const created = this.persist(this.store.replace({
       sessionID,
@@ -164,8 +172,11 @@ export class GoalService {
       constraints: command.constraints,
       checks: command.checks,
     }));
-    if (options.start !== false) await this.prompt(created, "start");
-    return formatGoalStatus(this.store.get(sessionID) ?? created);
+    if (options.start !== false) {
+      await this.takeOver(sessionID, options.steer !== false);
+      await this.prompt(created, "start");
+    }
+    return formatGoalReceipt(this.store.get(sessionID) ?? created, "set");
   }
 
   async createFromModel(
@@ -324,6 +335,7 @@ export class GoalService {
   async handleInterrupt(sessionID: string) {
     const goal = this.store.get(sessionID);
     if (!goal || goal.status !== "active") return goal;
+    if (goal.steerUntil && this.now() < goal.steerUntil) return goal;
     return this.persist(
       this.store.update(sessionID, goal.goalID, {
         status: "paused",
@@ -332,21 +344,48 @@ export class GoalService {
     );
   }
 
-  async handleResume(sessionID: string) {
+  async takeOver(sessionID: string, enabled = true) {
+    if (!enabled || !this.client?.abort) return false;
+    const session = await this.client.session?.(sessionID);
+    if (!session?.busy) return false;
     const goal = this.store.get(sessionID);
+    if (goal) {
+      this.persist(
+        this.store.update(sessionID, goal.goalID, {
+          steerUntil: this.now() + 8_000,
+          continuationSuppressed: false,
+        }),
+      );
+    }
+    await this.client.abort(sessionID);
+    return true;
+  }
+
+  async handleResume(sessionID: string) {
+    let goal = this.store.get(sessionID);
     if (
-      !goal ||
-      goal.status !== "paused" ||
-      goal.pauseReason !== "interrupt" ||
-      !this.options.autoResumeInterrupted
-    ) return goal;
-    return this.persist(
-      this.store.update(sessionID, goal.goalID, {
-        status: "active",
-        pauseReason: undefined,
-        continuationSuppressed: false,
-      }),
-    );
+      goal?.status === "paused" &&
+      goal.pauseReason === "interrupt" &&
+      this.options.autoResumeInterrupted
+    ) {
+      goal = this.persist(
+        this.store.update(sessionID, goal.goalID, {
+          status: "active",
+          pauseReason: undefined,
+          continuationSuppressed: false,
+        }),
+      );
+    }
+    if (!goal || goal.status !== "active") return goal;
+    await this.maybeContinue(sessionID);
+    return this.store.get(sessionID) ?? goal;
+  }
+
+  async recoverActive() {
+    const active = this.store.listActive();
+    for (const goal of active) {
+      await this.handleIdle(goal.sessionID).catch(() => undefined);
+    }
   }
 
   close() {

@@ -113,16 +113,15 @@ describe("declarative workflow runtime", () => {
       "failed",
       "cancelled",
     ]);
-    expect(runner.calls.map((call) => call.member.id)).toEqual([
-      "lead",
-      "worker",
-    ]);
-    expect(run.steps[0]?.error).toContain("worker: step failed");
+    expect(runner.calls.map((call) => call.member.id)).toEqual(["lead"]);
+    expect(run.steps[0]?.error).toContain("lead: step failed");
   });
 
-  test("falls back to the next fleet seat when the assigned member fails", async () => {
+  test("does not start another fleet seat when the assigned member fails", async () => {
+    const started: string[] = [];
     const runner: AgentRunner = {
       async run(input) {
+        started.push(input.member.id);
         if (input.member.id === "lead") throw new Error("usage limit");
         return {
           memberID: input.member.id,
@@ -139,18 +138,20 @@ describe("declarative workflow runtime", () => {
       { name: "fallback", steps: [{ id: "change", prompt: "implement" }] },
       "",
     );
-    expect(run.status).toBe("completed");
+    expect(run.status).toBe("failed");
+    expect(started).toEqual(["lead"]);
     expect(run.steps[0]).toMatchObject({
-      status: "completed",
-      memberID: "worker",
+      status: "failed",
+      memberID: "lead",
     });
-    expect(run.steps[0]?.output).toContain("Fell back to worker");
-    expect(run.steps[0]?.output).toContain("patched");
+    expect(run.steps[0]?.error).toContain("usage limit");
   });
 
-  test("times out a hung seat and continues on the next member", async () => {
+  test("fails a hung assigned seat instead of hopping to another worker", async () => {
+    const started: string[] = [];
     const runner: AgentRunner = {
       async run(input) {
+        started.push(input.member.id);
         if (input.member.id === "lead") {
           await new Promise((_, reject) => {
             input.signal?.addEventListener("abort", () => {
@@ -174,10 +175,10 @@ describe("declarative workflow runtime", () => {
       "",
       { seatTimeoutMs: 20 },
     );
-    expect(run.status).toBe("completed");
-    expect(run.steps[0]?.memberID).toBe("worker");
-    expect(run.steps[0]?.output).toContain("timed out");
-    expect(run.steps[0]?.output).toContain("done after hang");
+    expect(run.status).toBe("failed");
+    expect(started).toEqual(["lead"]);
+    expect(run.steps[0]?.memberID).toBe("lead");
+    expect(run.steps[0]?.error).toContain("timed out");
   });
 
   test("allows dependents when the failed step declares continueOnError", async () => {

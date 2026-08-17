@@ -10,6 +10,9 @@ import { asBtwClient } from "./client.ts";
 import { parseOptions } from "./options.ts";
 import { SideRegistry } from "./registry.ts";
 import { BtwError, SideRunner, type SideExchange } from "./runner.ts";
+import { btwSlashQuestion } from "./slash.ts";
+
+const SUBMIT_PRIORITY = 20_000;
 
 const ROUTE_ANSWER = "btw.answer";
 
@@ -43,6 +46,20 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       ),
     },
   ]);
+
+  api.lifecycle.onDispose(interceptSlashSubmit(api, {
+    match: btwSlashQuestion,
+    onMatch: (question) => {
+      void runSideQuestion(
+        api,
+        runner,
+        registry,
+        setOverlay,
+        options,
+        question,
+      );
+    },
+  }));
 
   api.keymap.registerLayer({
     commands: [
@@ -373,6 +390,35 @@ function goBack(api: TuiPluginApi, params?: Record<string, unknown>) {
 
 function toast(api: TuiPluginApi, message: string, variant: "info" | "success" | "warning" | "error") {
   api.ui.toast({ variant, message });
+}
+
+function interceptSlashSubmit(
+  api: TuiPluginApi,
+  handler: {
+    match: (text: string) => string | undefined;
+    onMatch: (args: string) => void;
+  },
+) {
+  return api.keymap.intercept("key", (ctx) => {
+    if (!isSubmitKey(ctx.event) || api.ui.dialog.open) return;
+    const editor = api.renderer.currentFocusedEditor;
+    if (!editor) return;
+    const args = handler.match(editor.plainText);
+    if (args === undefined) return;
+    ctx.consume();
+    editor.clear();
+    handler.onMatch(args);
+  }, { priority: SUBMIT_PRIORITY });
+}
+
+function isSubmitKey(event: {
+  name: string;
+  ctrl?: boolean;
+  meta?: boolean;
+  shift?: boolean;
+}) {
+  return (event.name === "return" || event.name === "enter") &&
+    !event.ctrl && !event.meta && !event.shift;
 }
 
 export default { id: "opencode-btw", tui } satisfies TuiPluginModule;

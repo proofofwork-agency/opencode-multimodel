@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { adaptGoalClient, createdSessionID, httpJudge } from "../src/opencode.ts";
+import { adaptGoalClient, createdSessionID, httpJudge, isGoalRuntimePrompt } from "../src/opencode.ts";
+
+test("treats goal receipts and contracts as runtime text, not queued user input", () => {
+  expect(isGoalRuntimePrompt("<opencode_goal_receipt>\nPersisted thread goal: set.")).toBe(true);
+  expect(isGoalRuntimePrompt("PERSISTED THREAD GOAL — not a one-shot prompt.")).toBe(true);
+  expect(isGoalRuntimePrompt("please fix the tests")).toBe(false);
+});
 
 test("session reads do not send a GET body", async () => {
   const calls: Array<{ name: string; input: unknown }> = [];

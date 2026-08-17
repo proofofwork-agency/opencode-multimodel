@@ -14,10 +14,19 @@ async function setup(input: {
 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
   const prompts: string[] = [];
+  const aborted: string[] = [];
   const client = {
+    busy: false,
     async prompt(request: { sessionID: string; text: string }) {
       prompts.push(request.text);
       return { text: "working", hadTools: true, tokens: 20 };
+    },
+    async session() {
+      return { busy: client.busy };
+    },
+    async abort(sessionID: string) {
+      aborted.push(sessionID);
+      client.busy = false;
     },
     async children() {
       return input.children ?? [];
@@ -46,7 +55,7 @@ async function setup(input: {
       reason: "still working",
     },
   });
-  return { directory, prompts, service };
+  return { directory, prompts, aborted, client, service };
 }
 
 test("sets a goal and starts a work turn", async () => {
@@ -55,8 +64,10 @@ test("sets a goal and starts a work turn", async () => {
     "ses",
     `fix tests --check "npm test" --budget 50k`,
   );
+  expect(status).toContain("Persisted thread goal: set.");
   expect(status).toContain("fix tests");
   expect(status).toContain("State: active");
+  expect(prompts[0]).toContain("<opencode_goal_receipt>");
   expect(prompts[0]).toContain("<untrusted_objective>");
   expect(service.get("ses")?.checks).toEqual(["npm test"]);
   service.close();
@@ -69,7 +80,7 @@ test("continues only while the goal is active and not suppressed", async () => {
   });
   const first = await service.maybeContinue("ses");
   expect(first).toEqual({ action: "continue", kind: "continuation" });
-  expect(prompts.at(-1)).toContain("Continue working toward the active thread goal");
+  expect(prompts.at(-1)).toContain("Continue working toward the persisted thread goal");
   const goal = service.get("ses")!;
   service.store.update("ses", goal.goalID, { continuationSuppressed: true });
   expect((await service.maybeContinue("ses")).action).toBe("skip");
@@ -188,6 +199,56 @@ test("fails closed when a host check fails", async () => {
   });
   expect(result.approved).toBe(false);
   expect(result.reason).toContain("Host check failed");
+  service.close();
+});
+
+test("steers a busy session by aborting the live turn then starting the goal", async () => {
+  const { service, client, aborted, prompts } = await setup();
+  client.busy = true;
+  await service.apply("ses", { action: "set", objective: "take over", checks: [] });
+  expect(aborted).toEqual(["ses"]);
+  expect(prompts.at(-1)).toContain("take over");
+  expect(service.get("ses")?.status).toBe("active");
+  expect(service.get("ses")?.steerUntil).toBe(9_000);
+  service.close();
+});
+
+test("steer abort does not pause the goal as an interrupt", async () => {
+  const { service } = await setup();
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+  });
+  const goal = service.get("ses")!;
+  service.store.update("ses", goal.goalID, { steerUntil: Date.now() + 8_000 });
+  await service.handleInterrupt("ses");
+  expect(service.get("ses")?.status).toBe("active");
+  expect(service.get("ses")?.pauseReason).toBeUndefined();
+  service.close();
+});
+
+test("reopening an active goal continues the runtime", async () => {
+  const { service, prompts } = await setup();
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+  });
+  expect(prompts).toEqual([]);
+  await service.handleResume("ses");
+  expect(prompts.at(-1)).toContain("persisted thread goal");
+  expect(service.get("ses")?.status).toBe("active");
+  service.close();
+});
+
+test("recoverActive continues every stored active goal", async () => {
+  const { service, prompts } = await setup();
+  await service.apply("ses-a", { action: "set", objective: "one", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses-b", { action: "set", objective: "two", checks: [] }, {
+    start: false,
+  });
+  await service.recoverActive();
+  expect(prompts.some((text) => text.includes("one"))).toBe(true);
+  expect(prompts.some((text) => text.includes("two"))).toBe(true);
   service.close();
 });
 

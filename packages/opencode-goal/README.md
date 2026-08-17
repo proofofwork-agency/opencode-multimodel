@@ -50,7 +50,14 @@ Stop-hook re-entry.
 }
 ```
 
-OpenCode loads the package’s `./server` and `./tui` exports.
+OpenCode loads the package’s `./server` and `./tui` exports. Add the same spec
+to `tui.json` as well as `opencode.json`; the TUI list is separate, and `/goal`
+only intercepts the busy-session queue when the TUI entry is loaded.
+
+`/goal` applies immediately and **steers the live session**. Status, pause,
+clear, and budget never enqueue a turn. Set and resume persist the contract,
+abort the current turn if it is running, and start a goal turn so the session
+is taken over instead of ignoring `/goal` until idle.
 
 ## Use
 
@@ -69,8 +76,18 @@ Useful flags on set:
 - `--verify "..."` extra success criteria
 - `--constraint "..."` non-goals and hard limits
 
-Setting a goal starts work on the current turn. After that turn goes idle, the
-plugin continues automatically while the goal is `active` and inside budget.
+Setting a goal writes a persisted record (SQLite + `.opencode/goals/<session>.json`)
+and posts a receipt into the session. That is the confirmation a goal exists —
+not a one-shot prompt. Agents receive the same contract on every later turn via
+the system prompt and `get_goal`. Completion only happens through `update_goal`
+plus evidence.
+
+Setting a goal takes over the current session: if a turn is already running,
+that turn is aborted and replaced with the goal start prompt. The runtime then
+keeps going for as long as the OpenCode process is up — one continuation per
+idle, including after you reopen the session or restart OpenCode. It is not a
+detached daemon: close the process and the loop pauses until that session is
+open again.
 
 ## How the loop stops
 

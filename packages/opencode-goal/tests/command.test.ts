@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
 import { parseBudget, parseGoalCommand } from "../src/command.ts";
+import {
+  goalSlashArguments,
+  sessionLooksBusy,
+  shouldStartGoalTurn,
+  shouldSteerLiveTurn,
+} from "../src/slash.ts";
 
 test("empty arguments are status", () => {
   expect(parseGoalCommand("")).toEqual({ action: "status" });
@@ -36,6 +42,30 @@ test("parses equals-style flags", () => {
     constraints: undefined,
     checks: [],
   });
+});
+
+test("extracts /goal arguments from a TUI submit line", () => {
+  expect(goalSlashArguments("hello")).toBeUndefined();
+  expect(goalSlashArguments("/btw why")).toBeUndefined();
+  expect(goalSlashArguments("/goal")).toBe("");
+  expect(goalSlashArguments("/goal status")).toBe("status");
+  expect(goalSlashArguments("/GOAL  pause")).toBe("pause");
+  expect(goalSlashArguments(`/goal fix auth --check "npm test"`)).toBe(
+    `fix auth --check "npm test"`,
+  );
+});
+
+test("set and resume always start a turn and steer a busy session", () => {
+  expect(sessionLooksBusy({ type: "busy" })).toBe(true);
+  expect(sessionLooksBusy({ type: "retry" })).toBe(true);
+  expect(sessionLooksBusy({ type: "idle" })).toBe(false);
+  expect(shouldStartGoalTurn("set")).toBe(true);
+  expect(shouldStartGoalTurn("resume")).toBe(true);
+  expect(shouldStartGoalTurn("pause")).toBe(false);
+  expect(shouldSteerLiveTurn("set", true)).toBe(true);
+  expect(shouldSteerLiveTurn("resume", true)).toBe(true);
+  expect(shouldSteerLiveTurn("set", false)).toBe(false);
+  expect(shouldSteerLiveTurn("pause", true)).toBe(false);
 });
 
 test("unwraps a fully quoted argument blob from OpenCode", () => {
