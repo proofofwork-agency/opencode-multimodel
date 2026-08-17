@@ -38,6 +38,10 @@ goal turn.
 
 ## Use
 
+Long results (`/goal history`, big status output) do not dump into a
+toast: they open a scrollable, closeable dialog (esc) with the full text,
+while the toast keeps a one-line summary.
+
 ```text
 /goal Reduce p95 checkout latency below 120 ms --check "npm test" --budget 500k
 /goal status

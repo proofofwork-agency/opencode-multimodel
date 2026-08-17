@@ -1,7 +1,39 @@
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui";
-import { createSignal, onCleanup, Show } from "solid-js";
+/** @jsxImportSource @opentui/solid */
+import type { TuiDialogStack, TuiPluginApi } from "@opencode-ai/plugin/tui";
+import { createSignal, For, onCleanup, Show } from "solid-js";
 import type { GoalService } from "./engine.ts";
 import type { Goal } from "./types.ts";
+
+export function openGoalDialog(
+  api: TuiPluginApi,
+  title: string,
+  body: string,
+): boolean {
+  const dialog = (api.ui as { dialog?: TuiDialogStack }).dialog;
+  if (!dialog?.replace) return false;
+  const theme = api.theme.current;
+  try {
+    dialog.setSize?.("xlarge");
+    dialog.replace(() => (
+      <scrollbox
+        scrollY={true}
+        stickyStart="top"
+        height="100%"
+        paddingLeft={1}
+        paddingRight={1}
+        flexDirection="column"
+      >
+        <text fg={theme.text}>{title}</text>
+        <For each={body.split("\n")}>
+          {(line) => <text fg={theme.textMuted}>{line || " "}</text>}
+        </For>
+      </scrollbox>
+    ));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function registerGoalSidebar(api: TuiPluginApi, goals: GoalService) {
   const slots = (api as TuiPluginApi & {

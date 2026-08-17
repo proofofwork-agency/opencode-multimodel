@@ -10,6 +10,17 @@ import {
 } from "./slash.ts";
 
 const SUBMIT_PRIORITY = 50_000;
+const LONG_RESULT_LINES = 30;
+const LONG_RESULT_CHARS = 1_200;
+
+export function isLongResult(text: string) {
+  return text.length > LONG_RESULT_CHARS ||
+    text.split("\n").length > LONG_RESULT_LINES;
+}
+
+function firstLine(text: string) {
+  return text.split("\n")[0] ?? "";
+}
 
 const tui: TuiPlugin = async (api, rawOptions) => {
   const options = parseOptions(rawOptions);
@@ -30,6 +41,23 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     message: string,
     variant: "info" | "success" | "warning" | "error" = "info",
   ) => {
+    if (isLongResult(message)) {
+      api.ui.toast({
+        title: "Goal",
+        message:
+          `${firstLine(message).slice(0, 80)} — full output opened in a dialog (esc to close).`,
+        variant,
+        duration: 12_000,
+      });
+      void import("./tui-sidebar.tsx").then((mod) => {
+        try {
+          mod.openGoalDialog(api, "Goal", message);
+        } catch {
+          // Dialog is optional; the toast already surfaced the summary.
+        }
+      }).catch(() => undefined);
+      return;
+    }
     api.ui.toast({ title: "Goal", message, variant, duration: 12_000 });
   };
 
