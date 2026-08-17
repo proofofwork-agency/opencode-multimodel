@@ -1,14 +1,15 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui";
 import { parseGoalCommand } from "./command.ts";
 import { createGoalService } from "./engine.ts";
+import { formatHistory } from "./history.ts";
 import { parseOptions } from "./options.ts";
-import { formatGoalStatus } from "./prompts.ts";
+import { formatContractStatus, formatGoalStatus } from "./prompts.ts";
 import {
   goalSlashArguments,
   shouldStartGoalTurn,
 } from "./slash.ts";
 
-const SUBMIT_PRIORITY = 20_000;
+const SUBMIT_PRIORITY = 50_000;
 
 const tui: TuiPlugin = async (api, rawOptions) => {
   const options = parseOptions(rawOptions);
@@ -39,8 +40,13 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       const command = parseGoalCommand(raw);
       const start = shouldStartGoalTurn(command.action);
       const message = await goals.apply(id, command, { start, steer: true });
+      const goal = goals.get(id);
       notify(
-        message,
+        command.action === "set" && goal
+          ? `Goal set: ${goal.objective}`
+          : command.action === "resume"
+          ? "Goal resumed."
+          : message,
         command.action === "set" || command.action === "resume" ? "success" : "info",
       );
       if (command.action === "set" || command.action === "resume") {
@@ -60,6 +66,14 @@ const tui: TuiPlugin = async (api, rawOptions) => {
       void applyFromSlash(args);
     },
   }));
+
+  void import("./tui-sidebar.tsx").then((mod) => {
+    try {
+      mod.registerGoalSidebar(api, goals);
+    } catch {
+      // Sidebar is optional. Slash intercept must keep working.
+    }
+  }).catch(() => undefined);
 
   api.keymap.registerLayer({
     commands: [
@@ -89,6 +103,32 @@ const tui: TuiPlugin = async (api, rawOptions) => {
           const id = sessionID();
           if (!id) return notify("Open a session before using /goal.", "warning");
           notify(formatGoalStatus(goals.get(id)));
+        },
+      },
+      {
+        name: "goal.history",
+        title: "Goal history",
+        description: "Show bounded lifecycle history for the current goal",
+        category: "Goal",
+        namespace: "palette",
+        slashName: "goal-history",
+        run() {
+          const id = sessionID();
+          if (!id) return notify("Open a session before using /goal.", "warning");
+          notify(formatHistory(goals.get(id)));
+        },
+      },
+      {
+        name: "goal.contract",
+        title: "Goal contract",
+        description: "Show the frozen Dogfood contract path and hash",
+        category: "Goal",
+        namespace: "palette",
+        slashName: "goal-contract",
+        run() {
+          const id = sessionID();
+          if (!id) return notify("Open a session before using /goal.", "warning");
+          notify(formatContractStatus(goals.get(id)));
         },
       },
       {

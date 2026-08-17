@@ -39,7 +39,7 @@ export function goalPromptPrefix(snapshot: GoalSnapshot | undefined) {
     snapshot.checks?.length
       ? `Host checks: ${snapshot.checks.join(" | ")}`
       : undefined,
-    "Do not invoke Codex CLI /goal. Return evidence for this slice; the parent goal loop decides completion.",
+    "Return evidence for this slice; the parent goal loop decides completion.",
   ].filter(Boolean).join("\n");
 }
 

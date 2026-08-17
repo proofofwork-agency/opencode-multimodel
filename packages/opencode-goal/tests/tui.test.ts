@@ -77,7 +77,7 @@ test("registers /goal as a TUI command and intercepts submit so it is not queued
   expect(layers[0]?.commands?.map((command) => command.slashName)).toContain(
     "goal",
   );
-  expect(intercepts).toEqual([{ name: "key", priority: 20_000 }]);
+  expect(intercepts).toEqual([{ name: "key", priority: 50_000 }]);
 
   const consumed: boolean[] = [];
   interceptFn?.({

@@ -1,16 +1,16 @@
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
-import { createGoalService } from "./engine.ts";
+import { createGoalService, GoalOwnedError } from "./engine.ts";
 import { parseGoalCommand } from "./command.ts";
+import { formatHistory } from "./history.ts";
 import { isAbortError } from "./opencode.ts";
 import { parseOptions } from "./options.ts";
 import {
   agentGoalSystemBlock,
   budgetLimitPrompt,
-  continuationPrompt,
   formatGoalReceipt,
   formatGoalStatus,
-  startPrompt,
+  goalModePolicy,
 } from "./prompts.ts";
 
 const server: Plugin = async (input, rawOptions) => {
@@ -36,18 +36,36 @@ const server: Plugin = async (input, rawOptions) => {
     async "command.execute.before"(event, output) {
       if (event.command !== "goal") return;
       try {
+        const alreadySteering = goals.get(event.sessionID);
+        if (
+          alreadySteering?.steerUntil &&
+          Date.now() < alreadySteering.steerUntil
+        ) {
+          output.parts = [{
+            type: "text",
+            text: formatGoalReceipt(alreadySteering, "set"),
+          }] as typeof output.parts;
+          return;
+        }
         const command = parseGoalCommand(event.arguments ?? "");
-        await goals.apply(event.sessionID, command, { start: false, steer: true });
+        const agent = (event as { agent?: string }).agent;
+        await goals.apply(event.sessionID, command, {
+          start: false,
+          steer: true,
+          agent,
+        });
         if (command.action === "set" || command.action === "resume") {
           await goals.takeOver(event.sessionID);
         }
         const goal = goals.get(event.sessionID);
         const text = command.action === "set" && goal
-          ? startPrompt(goal)
+          ? formatGoalReceipt(goal, "set")
           : command.action === "resume" && goal?.status === "active"
-          ? continuationPrompt(goal)
+          ? formatGoalReceipt(goal, "resumed")
           : command.action === "status"
           ? formatGoalStatus(goal)
+          : command.action === "history"
+          ? formatHistory(goal)
           : formatGoalReceipt(
             goal,
             command.action === "pause"
@@ -56,6 +74,8 @@ const server: Plugin = async (input, rawOptions) => {
               ? "cleared"
               : command.action === "budget"
               ? "budget"
+              : command.action === "edit"
+              ? "edited"
               : "updated",
           );
         output.parts = [{ type: "text", text }] as typeof output.parts;
@@ -67,55 +87,6 @@ const server: Plugin = async (input, rawOptions) => {
       }
     },
     tool: {
-      goal_control: tool({
-        description:
-          "User/system control surface for the persisted thread goal.",
-        args: {
-          action: tool.schema.enum([
-            "status",
-            "set",
-            "pause",
-            "resume",
-            "clear",
-            "budget",
-          ]),
-          objective: tool.schema.string().optional(),
-          tokenBudget: tool.schema.number().int().positive().optional(),
-          verification: tool.schema.string().optional(),
-          constraints: tool.schema.string().optional(),
-          check: tool.schema.string().optional(),
-        },
-        async execute(args, context) {
-          if (args.action === "set") {
-            const objective = args.objective?.trim();
-            if (!objective) {
-              throw new Error("objective is required to set a goal.");
-            }
-            return goals.apply(context.sessionID, {
-              action: "set",
-              objective,
-              tokenBudget: args.tokenBudget,
-              verification: args.verification,
-              constraints: args.constraints,
-              checks: args.check ? [args.check] : [],
-            }, { start: false });
-          }
-          if (args.action === "budget") {
-            return goals.apply(context.sessionID, {
-              action: "budget",
-              tokenBudget: args.tokenBudget,
-            }, { start: false });
-          }
-          if (args.action === "status") {
-            return goals.apply(context.sessionID, { action: "status" }, {
-              start: false,
-            });
-          }
-          return goals.apply(context.sessionID, { action: args.action }, {
-            start: false,
-          });
-        },
-      }),
       create_goal: tool({
         description:
           "Create a persisted thread goal only when the user or system explicitly asked for a goal. Do not infer goals from ordinary tasks.",
@@ -127,30 +98,74 @@ const server: Plugin = async (input, rawOptions) => {
           check: tool.schema.string().optional(),
         },
         async execute(args, context) {
-          const goal = await goals.createFromModel(context.sessionID, {
-            objective: args.objective,
-            tokenBudget: args.token_budget,
-            verification: args.verification,
-            constraints: args.constraints,
-            checks: args.check ? [args.check] : [],
-          });
-          return JSON.stringify({ goal, created: true });
+          try {
+            const goal = await goals.createFromModel(context.sessionID, {
+              objective: args.objective,
+              tokenBudget: args.token_budget,
+              verification: args.verification,
+              constraints: args.constraints,
+              checks: args.check ? [args.check] : [],
+            }, context.agent);
+            return JSON.stringify({ goal, created: true });
+          } catch (error) {
+            if (error instanceof GoalOwnedError) {
+              return JSON.stringify({ error: error.code });
+            }
+            throw error;
+          }
         },
       }),
       update_goal: tool({
         description:
-          "Mark the active thread goal complete only after an evidence audit of the current workspace. Pause, resume, and budget changes are system-controlled.",
+          "Mark the active thread goal complete or unmet after an evidence audit. Pause, resume, budget, and contract changes are user-controlled.",
         args: {
-          status: tool.schema.enum(["complete"]),
+          status: tool.schema.enum(["complete", "unmet"]),
           evidence: tool.schema.string().optional(),
           summary: tool.schema.string().optional(),
+          blocker: tool.schema.string().optional(),
+          criteria: tool.schema.array(tool.schema.object({
+            criterion: tool.schema.string().optional(),
+            evidence: tool.schema.array(tool.schema.string()).optional(),
+          })).optional(),
+          checks: tool.schema.array(tool.schema.object({
+            command: tool.schema.string().optional(),
+            result: tool.schema.enum(["passed", "failed", "not-run"]).optional(),
+          })).optional(),
         },
         async execute(args, context) {
-          const result = await goals.completeFromModel(context.sessionID, {
-            evidence: args.evidence,
-            summary: args.summary,
-          });
-          return JSON.stringify(result);
+          try {
+            if (args.status === "unmet") {
+              const goal = await goals.markUnmet(
+                context.sessionID,
+                args.blocker ?? args.evidence ?? "",
+              );
+              return JSON.stringify({
+                approved: false,
+                goal,
+                reason: goal.blocker,
+              });
+            }
+            const result = await goals.completeFromModel(context.sessionID, {
+              evidence: args.evidence,
+              summary: args.summary,
+              criteria: args.criteria?.flatMap((item) =>
+                item.criterion
+                  ? [{ criterion: item.criterion, evidence: item.evidence ?? [] }]
+                  : [],
+              ),
+              checks: args.checks?.flatMap((item) =>
+                item.command || item.result
+                  ? [{ command: item.command, result: item.result }]
+                  : [],
+              ),
+            });
+            return JSON.stringify(result);
+          } catch (error) {
+            if (error instanceof GoalOwnedError) {
+              return JSON.stringify({ error: error.code });
+            }
+            throw error;
+          }
         },
       }),
       get_goal: tool({
@@ -174,6 +189,13 @@ const server: Plugin = async (input, rawOptions) => {
         await goals.handleIdle(sessionID).catch(() => undefined);
         return;
       }
+      if (event.event.type === "session.status") {
+        const status = (event.event.properties as { status?: { type?: string } })
+          ?.status;
+        if (status?.type === "busy") goals.armWatchdog(sessionID);
+        if (status?.type === "idle") goals.clearWatchdog(sessionID);
+        return;
+      }
       if (event.event.type === "session.error") {
         const error = (event.event.properties as { error?: unknown })?.error;
         if (isAbortError(error)) await goals.handleInterrupt(sessionID);
@@ -191,6 +213,7 @@ const server: Plugin = async (input, rawOptions) => {
       goals.noteHumanMessage(input.sessionID, text);
     },
     async "experimental.chat.system.transform"(input, output) {
+      output.system.push(goalModePolicy());
       const sessionID = input.sessionID;
       if (!sessionID) return;
       const goal = goals.get(sessionID);
@@ -209,6 +232,12 @@ const server: Plugin = async (input, rawOptions) => {
             : undefined,
         ].filter(Boolean).join("\n"),
       );
+    },
+    async "experimental.compaction.autocontinue"(input, output) {
+      const goal = goals.get(input.sessionID);
+      if (goal && (goal.status === "active" || goal.status === "budget_limited")) {
+        output.enabled = false;
+      }
     },
     async dispose() {
       goals.close();

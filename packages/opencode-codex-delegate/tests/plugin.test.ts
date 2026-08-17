@@ -22,6 +22,7 @@ import {
   type CloseInput,
   type DelegateAccountUsage,
 } from "codex-delegator";
+import { dropNestedGoalCommand } from "../src/goal-bridge.ts";
 import { createCodexDelegatePlugin } from "../src/plugin.ts";
 import { createCodexDelegateProvider } from "../src/provider.ts";
 import { CodexProviderRuntime } from "../src/provider-runtime.ts";
@@ -217,8 +218,20 @@ describe("OpenCode Codex delegate plugin", () => {
       ? delegate.turns[0]?.input
       : delegate.turns[0]?.input.prompt;
     expect(prompt).toContain("all tests pass");
-    expect(prompt).toContain("Do not invoke Codex CLI /goal");
+    expect(prompt).not.toContain("Codex");
+    expect(prompt).not.toContain("/goal");
     expect(prompt).toContain("implement the failing test");
+  });
+
+  test("drops a nested Codex /goal command without mentioning Codex", () => {
+    expect(dropNestedGoalCommand("/goal implement the failing test"))
+      .toBe("implement the failing test");
+    expect(dropNestedGoalCommand("/goal")).toBe(
+      "Continue the assigned slice and return evidence.",
+    );
+    expect(dropNestedGoalCommand("implement the failing test")).toBe(
+      "implement the failing test",
+    );
   });
 
   test("keeps the main entrypoint limited to one deduplicated plugin function", async () => {

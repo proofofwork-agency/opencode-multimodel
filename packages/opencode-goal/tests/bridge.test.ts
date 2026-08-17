@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isCodexDelegateModel, multimodelRunGate } from "../src/bridge.ts";
 import { formatGoalInjection, GoalSnapshotStore } from "../src/snapshot.ts";
+import { defaultGoalFields } from "../src/types.ts";
 
 test("detects an in-flight multimodel run for the same session", async () => {
   const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
@@ -56,8 +57,10 @@ test("identifies Codex delegate models and writes snapshots other plugins can re
     noToolStreak: 0,
     createdAt: 1,
     updatedAt: 2,
+    ...defaultGoalFields(),
   });
   const injection = formatGoalInjection(snapshots.read("ses")!);
   expect(injection).toContain("migrate auth");
-  expect(injection).toContain("Do not invoke Codex CLI /goal");
+  expect(injection).toContain("parent goal loop");
+  expect(injection).not.toContain("Codex");
 });

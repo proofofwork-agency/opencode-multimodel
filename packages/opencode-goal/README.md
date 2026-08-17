@@ -9,12 +9,14 @@ belongs to one OpenCode session. The plugin keeps that objective across turns,
 compaction, and interrupts, and it only marks the goal complete after an
 evidence audit.
 
-The model can start a goal and propose completion. It cannot pause, resume, or
-change the budget. Pause is user or interrupt. Resume is explicit or interrupt
-recovery. Crossing a token budget is `budget_limited`. Completion is
-fail-closed: a host check or a cited existing file, plus an independent
-small-model verdict of `met`. The judge can also return `impossible`, which
-is a terminal stop.
+The model can start a goal and propose completion. It cannot pause, resume,
+change the budget, or edit the Dogfood contract. Pause is user, interrupt, or
+restart recovery. Completion is fail-closed: a frozen Dogfood contract or host
+`--check`, plus an independent judge verdict of `met`. The judge can also
+return `impossible`. The worker can stop with `unmet` and a concrete blocker.
+
+The judge and contract author are ephemeral OpenCode sessions created by this
+package. They do not come from `opencode-multimodel`.
 
 ## Install
 
@@ -27,82 +29,125 @@ is a terminal stop.
 ```
 
 OpenCode loads the package’s `./server` and `./tui` exports. Add the same spec
-to `tui.json` as well as `opencode.json`; the TUI list is separate, and `/goal`
-only intercepts the busy-session queue when the TUI entry is loaded.
+to `tui.json` as well as `opencode.json`.
 
 `/goal` applies immediately and **steers the live session**. Status, pause,
-clear, and budget never enqueue a turn. Set and resume persist the contract,
-abort the current turn if it is running, and start a goal turn so the session
-is taken over instead of ignoring `/goal` until idle.
+clear, budget, history, and contract never enqueue a turn. Set and resume
+persist the contract, abort the current turn if it is running, and start a
+goal turn.
 
 ## Use
 
 ```text
 /goal Reduce p95 checkout latency below 120 ms --check "npm test" --budget 500k
 /goal status
+/goal history
 /goal pause
 /goal resume
+/goal edit Keep the public API unchanged and still hit 120 ms
+/goal contract
+/goal contract apply
 /goal clear
 ```
 
 Useful flags on set:
 
 - `--budget 200k` token cap (`k` / `m` suffixes allowed)
-- `--check "npm test"` host-run proof; may be repeated
-- `--verify "..."` extra success criteria
+- `--check "npm test"` required host oracle; may be repeated
+- `--verify "..."` extra success criteria for the author/judge
 - `--constraint "..."` non-goals and hard limits
+- `--max-turns 25` auto-continue cap
+- `--max-minutes 30` elapsed-time cap
+- `--dogfood` / `--no-dogfood` turn the bundled Dogfood gate on or off for this goal
 
-Setting a goal writes a persisted record (SQLite + `.opencode/goals/<session>.json`)
-and posts a receipt into the session. That is the confirmation a goal exists —
-not a one-shot prompt. Agents receive the same contract on every later turn via
-the system prompt and `get_goal`. Completion only happens through `update_goal`
-plus evidence.
+Toggle later with `/goal dogfood on` or `/goal dogfood off`. Plugin default is
+on (`"dogfood": true`).
 
-Setting a goal takes over the current session: if a turn is already running,
-that turn is aborted and replaced with the goal start prompt. The runtime then
-keeps going for as long as the OpenCode process is up — one continuation per
-idle, including after you reopen the session or restart OpenCode. It is not a
-detached daemon: close the process and the loop pauses until that session is
-open again.
+On set, an independent **contract-author** session drafts a Dogfood YAML from
+the story. The plugin is the only writer: it validates, freezes, and hashes
+`.opencode/goals/<session>.contract.yaml`. If the project already has
+`.dogfood/dogfood.contract.yaml`, that file is bound and not rewritten. A
+human can edit the frozen YAML and run `/goal contract apply`. The worker
+cannot.
+
+Restart and crash recovery **continue** goals that were running (`active`,
+`budget_limited`, or paused only as `interrupt` / leftover `recovery`).
+User, plan, audit, and no-progress pauses stay paused. If SQLite is empty
+after a crash, the plugin rehydrates from `.opencode/goals/<session>.json`.
 
 ## How the loop stops
 
-The plugin does not spin. It continues once per idle, then waits for the next
-safe boundary.
+The plugin continues once per idle, then waits for the next safe boundary.
 
 It stops when:
 
-- host proof and the independent judge both say the goal is met (`complete`)
+- Dogfood / host proof and the independent judge both say `met` (`complete`)
 - the judge returns `impossible`
-- token usage reaches `--budget` (`budget_limited`)
+- the worker reports `unmet` with a concrete blocker
+- a token, turn, or duration budget is reached (`budget_limited`, after an 80% wrap-up)
 - you `/goal pause` or `/goal clear`
-- two continuation turns in a row make no tool calls
+- you send a message (default; opt in `steerWithoutPause`)
+- two reserved continuation turns make no tool calls, or repeated low-output turns
 - a child session is busy
 - the session is in plan mode
-- another user prompt is already queued
 - three prompt failures occur
-- you interrupt the turn (Esc/abort); `/goal resume` or a session re-open continues it
-
-`/goal resume` clears suppression and interrupt pauses. A user-paused goal
-stays paused until you resume it.
+- you interrupt the turn (Esc/abort); reopening the session or restarting
+  OpenCode continues that goal automatically
 
 ## Completion is fail-closed
 
-`update_goal { status: "complete" }` is not enough. After every idle turn a
-small-model judge votes `not_met`, `met`, or `impossible`, and `/goal status`
-shows that reason.
+`update_goal { status: "complete" }` is not enough.
 
-Completion also requires host proof:
-
-1. Reject empty or thin evidence.
-2. Run every `--check` on the host when `runHostChecks` is true.
-3. If there is no `--check`, the evidence must cite an existing project file.
-4. The independent judge must return `met`. `impossible` ends the goal.
-
-Passing tests in prose, a todo list, or elapsed effort are not enough.
+1. The frozen contract hash must still match the file bytes.
+2. The bundled Dogfood CLI (`@proofofwork-agency/dogfood`) validates and runs the frozen contract. If that CLI cannot be resolved, `--check` / cited files are used.
+3. The independent judge, in a separate no-tools session, must return `met`.
 
 Other plugins can read `.opencode/goals/<sessionID>.json` without importing
 this package.
+
+## OpenCode 2 (beta)
+
+The same plugin also runs inside OpenCode 2 beta. Add the **file path** of
+the V2 entry module to your project config:
+
+```json
+{ "plugins": ["…/opencode-goal/dist/oc2.js"] }
+```
+
+The V2 module registers the `/goal` command plus the `create_goal`,
+`update_goal`, `get_goal`, `goal_pause`, `goal_resume`, and `goal_clear`
+tools, persists the same `.opencode/goal.sqlite` state, freezes dogfood
+contracts, auto-continues idle sessions, and gates completion on evidence +
+host proof. The independent judge side session is off by default on OC2
+because the beta's `session.generate` returns empty text for long prompts;
+everything else matches V1 behavior. See `docs/opencode2.md` for the
+verified API map, limitations, and the live end-to-end smoke.
+
+## Multiple goals and sequences
+
+A session can hold more than one goal. Only the **focused** goal is
+auto-continued; backgrounded goals stay paused until you focus them.
+
+```
+/goal add write the migration guide     # backgrounds the current goal, focuses the new one
+/goal list                              # numbered goals; * marks the focused one
+/goal focus 1                           # switch focus (activates a backgrounded goal)
+```
+
+`/goal <objective>` replaces only the focused goal; backgrounded goals are
+kept. `/goal clear` still removes every goal in the session.
+
+Ordered sequences queue objectives that auto-promote one at a time:
+
+```
+/goal sequence build the parser; write the tests; ship the release
+```
+
+The first objective is focused and active; the rest are queued (`paused`,
+pause reason `queued`). When the focused goal completes with approved
+evidence, the next queued goal is focused, activated, and started
+automatically. Crash recovery never auto-resumes queued items; focus them
+explicitly.
 
 ## Options
 
@@ -115,18 +160,72 @@ this package.
     "minDelayMs": 1500,
     "maxPromptFailures": 3,
     "autoResumeInterrupted": true,
+    "steerWithoutPause": false,
     "runHostChecks": true,
     "requireHostProof": true,
     "judge": true,
+    "judgeModel": "anthropic/claude-sonnet-4-5",
+    "defaultMaxTurns": 25,
+    "defaultMaxDurationSeconds": 3600,
+    "wrapupRatio": 0.8,
+    "maxTurnTimeSeconds": 300,
+    "restrictedAgents": ["plan"],
+    "allowGoalExecutionFromPlan": false,
     "noToolTurnsBeforeSuppress": 2,
-    "checkTimeoutMs": 120000
+    "noProgressTokenThreshold": 50,
+    "maxNoProgressTurns": 2,
+    "checkTimeoutMs": 120000,
+    "dogfood": true
   }
 ]
 ```
 
+- `judgeModel` pins the independent judge (and contract author fallback model
+  selection is unchanged) to a `provider/model` string; unset uses the session's
+  current model.
+- `noProgressTokenThreshold` / `maxNoProgressTurns` pause the loop after
+  repeated continuation turns whose reported output tokens stay below the
+  threshold. Output tokens are only counted when the host reports them; unknown
+  output never triggers the pause.
+- `maxTurnTimeSeconds` arms a watchdog that re-checks the session and retries
+  continuation when a turn appears stuck; it never prompts while the session
+  still reports busy. Off by default.
+- `autoResumeInterrupted` also governs crash recovery: with `false`, goals
+  paused by an interrupt stay paused across restarts.
+- `--max-turns` is capped at 1000 and `--max-minutes` at 1440, matching the
+  plugin-level option bounds.
+
 State files are created `0600`. Add `.opencode/goal.sqlite*` and
 `.opencode/goals/` to `.gitignore` if you do not want local runtime state
 committed.
+
+## Multiple processes
+
+Only one OpenCode process may drive a session's goal. Each process claims the
+session in `goal_locks` (owner UUID + pid, refreshed on every touch). A second
+process that opens the same session becomes **passive** for that goal:
+
+- `/goal status` and `/goal history` still work (reads are allowed).
+- Mutations (`set`, `pause`, `resume`, `edit`, `clear`, completion tools)
+  fail closed with the stable error `session_owned_elsewhere`.
+- Auto-continue from the passive process is skipped with the reason
+  `session-owned-elsewhere`; it never prompts or mutates the goal.
+
+Locks expire 90 seconds after the last touch, or immediately when the owning
+process has died (pid liveness check), with a 10-minute hard cap. Restart
+recovery only takes over sessions whose owner is gone; it never steals a
+live owner's session. After the owner exits, retry a goal command or fork the
+session.
+
+`@proofofwork-agency/dogfood` is a regular dependency of this package. Installing
+the plugin installs the Dogfood CLI; users do not add it separately.
+
+Dogfood is not on npm yet. This workspace pins
+`file:../../../dogfood` and lists it in `bundleDependencies`, so a
+published `opencode-goal` tarball still contains the CLI. When
+`@proofofwork-agency/dogfood` is on the registry, switch the pin to that
+version (for example `0.4.0`) and drop `bundleDependencies` if you no
+longer need the tarball to carry a local copy.
 
 ## Development
 
@@ -134,4 +233,11 @@ committed.
 bun test
 bun run typecheck
 bun run build
+bun run benchmark
 ```
+
+`bun run benchmark` runs a deterministic, provider-free behavior benchmark
+(completion gating, contract tamper, loop safety, wrap-up, interrupt,
+recovery, ownership, plan mode, multi-goal sequences) that exits non-zero
+when any scenario fails. See `docs/comparison.md` for the scorecard against
+other goal plugins.

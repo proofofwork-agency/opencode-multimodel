@@ -23,6 +23,7 @@ test("injects an active parent goal into workflow child prompts", async () => {
   );
   const prompt = withGoalContext(directory, "ses_parent", "Implement the change.");
   expect(prompt).toContain("all auth tests pass");
-  expect(prompt).toContain("Do not invoke Codex CLI /goal");
+  expect(prompt).toContain("parent goal loop");
+  expect(prompt).not.toContain("Codex");
   expect(prompt).toContain("Implement the change.");
 });

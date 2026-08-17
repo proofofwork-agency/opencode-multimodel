@@ -15,7 +15,7 @@ export type { ContinuationContext, ContinuationDecision } from "./policy.ts";
 export { auditCompletion, inspectClaim, citedFiles } from "./evidence.ts";
 export { parseJudgeOutput, judgePrompt } from "./judge.ts";
 export type { JudgeResult, JudgeInput } from "./judge.ts";
-export { GoalService, createGoalService } from "./engine.ts";
+export { GoalService, createGoalService, GoalOwnedError } from "./engine.ts";
 export {
   continuationPrompt,
   budgetLimitPrompt,
@@ -23,15 +23,22 @@ export {
   goalContextBlock,
   formatGoalStatus,
   formatGoalReceipt,
+  formatContractStatus,
   agentGoalSystemBlock,
+  goalModePolicy,
+  escapeXml,
   completionBudgetReport,
   GOAL_RECEIPT_MARK,
 } from "./prompts.ts";
 export { multimodelRunGate, isCodexDelegateModel, delegatePrompt } from "./bridge.ts";
 export { adaptGoalClient, createdSessionID, httpJudge } from "./opencode.ts";
+export { CONTRACT_AUTHOR_ROLE, extractYamlDocument } from "./contract-author.ts";
 export {
   snapshotFromGoal,
+  goalFromSnapshot,
+  isCrashRecoverable,
   isTerminalStatus,
+  defaultGoalFields,
   GOAL_STATUSES,
   JUDGE_VERDICTS,
   TERMINAL_STATUSES,

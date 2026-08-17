@@ -7,6 +7,24 @@ test("treats goal receipts and contracts as runtime text, not queued user input"
   expect(isGoalRuntimePrompt("please fix the tests")).toBe(false);
 });
 
+test("sends goal start turns as synthetic so they stay off the chat", async () => {
+  const calls: unknown[] = [];
+  const client = adaptGoalClient({
+    session: {
+      async prompt(input: unknown) {
+        calls.push(input);
+        return { data: { parts: [{ type: "text", text: "ok" }] } };
+      },
+    },
+  });
+  await client.prompt({
+    sessionID: "ses_1",
+    text: "A persisted thread goal is now active.",
+    synthetic: true,
+  });
+  expect(JSON.stringify(calls[0])).toContain('"synthetic":true');
+});
+
 test("session reads do not send a GET body", async () => {
   const calls: Array<{ name: string; input: unknown }> = [];
   const client = adaptGoalClient({

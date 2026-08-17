@@ -1,3 +1,4 @@
+import { hardLimitReached, wrapupNeeded } from "./limits.ts";
 import type { Goal } from "./types.ts";
 import { isTerminalStatus } from "./types.ts";
 
@@ -20,6 +21,7 @@ export type ContinuationContext = {
   promptFailures: number;
   maxPromptFailures: number;
   noToolTurnsBeforeSuppress: number;
+  wrapupRatio: number;
 };
 
 export function decideContinuation(
@@ -49,6 +51,7 @@ export function decideContinuation(
   if (goal.status === "impossible") {
     return { action: "skip", reason: "impossible" };
   }
+  if (goal.status === "unmet") return { action: "skip", reason: "unmet" };
   if (goal.status === "paused") return { action: "skip", reason: "paused" };
   if (goal.status === "budget_limited") {
     if (goal.lastPromptKind === "budget_limit") {
@@ -66,6 +69,15 @@ export function decideContinuation(
     return { action: "impossible", reason: goal.lastVerdict.reason };
   }
   if (goal.lastVerdict?.verdict === "met") return { action: "complete" };
+  if (
+    wrapupNeeded(goal, context.now, context.wrapupRatio) ||
+    hardLimitReached(goal)
+  ) {
+    if (goal.lastPromptKind === "budget_limit") {
+      return { action: "skip", reason: "budget-already-reported" };
+    }
+    return { action: "continue", kind: "budget_limit" };
+  }
   return { action: "continue", kind: "continuation" };
 }
 

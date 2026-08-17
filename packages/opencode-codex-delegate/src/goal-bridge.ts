@@ -42,7 +42,14 @@ export function withGoalContext(
     `<untrusted_objective>\n${snapshot.objective}\n</untrusted_objective>`,
     snapshot.verification ? `Verification: ${snapshot.verification}` : undefined,
     snapshot.constraints ? `Constraints: ${snapshot.constraints}` : undefined,
-    "Do not invoke Codex CLI /goal. This OpenCode goal is already the outer loop.",
-    prompt,
+    dropNestedGoalCommand(prompt),
   ].filter(Boolean).join("\n\n");
+}
+
+/** OpenCode already owns the outer loop. Do not start a nested Codex /goal. */
+export function dropNestedGoalCommand(prompt: string) {
+  const match = prompt.match(/^\s*\/goal(?:\s+([\s\S]*))?$/i);
+  if (!match) return prompt;
+  return (match[1] ?? "").trim() ||
+    "Continue the assigned slice and return evidence.";
 }

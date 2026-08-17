@@ -23,7 +23,14 @@ export type GoalClient = {
     sessionID: string;
     text: string;
     noReply?: boolean;
-  }): Promise<{ text: string; hadTools: boolean; tokens: number }>;
+    agent?: string;
+    synthetic?: boolean;
+  }): Promise<{
+    text: string;
+    hadTools: boolean;
+    tokens: number;
+    outputTokens?: number;
+  }>;
   messages?(sessionID: string): Promise<SessionTurn[]>;
   session?(sessionID: string): Promise<{
     agent?: string;
@@ -35,6 +42,10 @@ export type GoalClient = {
     sessionID: string,
   ): Promise<Record<string, { type?: string } | string>>;
   judge?(
+    prompt: string,
+    options?: { model?: { id: string; providerID: string; variant?: string } },
+  ): Promise<string>;
+  author?(
     prompt: string,
     options?: { model?: { id: string; providerID: string; variant?: string } },
   ): Promise<string>;
@@ -75,11 +86,15 @@ export function adaptGoalClient(
 ): GoalClient {
   const typed = client as PluginSessionClient;
   return {
-    async prompt({ sessionID, text, noReply }) {
-      const response = await typed.session.prompt(legacyOrPath(sessionID, {
+    async prompt({ sessionID, text, noReply, agent, synthetic }) {
+      const body: Record<string, unknown> = {
         noReply: noReply === true,
-        parts: [{ type: "text", text }],
-      }));
+        parts: [{ type: "text", text, synthetic: synthetic === true }],
+      };
+      if (agent !== undefined) body.agent = agent;
+      const response = await typed.session.prompt(
+        legacyOrPath(sessionID, body),
+      );
       if (response.error) {
         throw new Error(`OpenCode prompt failed: ${describe(response.error)}`);
       }
@@ -89,10 +104,14 @@ export function adaptGoalClient(
         );
       }
       const parts = response.data?.parts ?? [];
+      const infoTokens = response.data?.info?.tokens;
       return {
         text: textFromParts(parts),
         hadTools: partsHaveTools(parts),
-        tokens: tokenTotal(response.data?.info?.tokens),
+        tokens: tokenTotal(infoTokens),
+        outputTokens: typeof infoTokens?.output === "number"
+          ? Math.max(0, infoTokens.output)
+          : undefined,
       };
     },
     async messages(sessionID) {
@@ -140,35 +159,57 @@ export function adaptGoalClient(
       await abort(pathOnly(sessionID));
     },
     async judge(prompt, options) {
-      if (transport.baseUrl) {
-        return httpJudge({
-          baseUrl: transport.baseUrl,
-          directory: transport.directory,
-          prompt,
-          model: options?.model,
-        });
-      }
-      const sessionID = await createJudgeSession(typed, options?.model);
-      try {
-        const parts = [{ type: "text", text: prompt }];
-        const response = await typed.session.prompt({
-          sessionID,
-          path: { id: sessionID },
-          body: { tools: { "*": false }, parts },
-        });
-        if (response.error) {
-          throw new Error(`Judge prompt failed: ${describe(response.error)}`);
-        }
-        const text = textFromParts(promptParts(response));
-        if (!text) throw new Error("Judge prompt returned no text.");
-        return text;
-      } finally {
-        await typed.session.abort?.(pathOnly(sessionID)).catch(() =>
-          undefined
-        );
-      }
+      return runSideSession(typed, transport, prompt, options?.model, {
+        title: "goal-judge",
+        tools: { "*": false },
+        label: "Judge",
+      });
+    },
+    async author(prompt, options) {
+      return runSideSession(typed, transport, prompt, options?.model, {
+        title: "goal-contract",
+        tools: { "*": false, read: true, glob: true, grep: true },
+        label: "Contract author",
+      });
     },
   };
+}
+
+async function runSideSession(
+  typed: PluginSessionClient,
+  transport: { baseUrl?: string; directory?: string },
+  prompt: string,
+  model: { id: string; providerID: string; variant?: string } | undefined,
+  options: { title: string; tools: Record<string, boolean>; label: string },
+) {
+  if (transport.baseUrl) {
+    return httpJudge({
+      baseUrl: transport.baseUrl,
+      directory: transport.directory,
+      prompt,
+      model,
+      title: options.title,
+      tools: options.tools,
+      timeoutMs: 120_000,
+    });
+  }
+  const sessionID = await createJudgeSession(typed, model, options.title);
+  try {
+    const parts = [{ type: "text", text: prompt }];
+    const response = await typed.session.prompt({
+      sessionID,
+      path: { id: sessionID },
+      body: { tools: options.tools, parts },
+    });
+    if (response.error) {
+      throw new Error(`${options.label} prompt failed: ${describe(response.error)}`);
+    }
+    const text = textFromParts(promptParts(response));
+    if (!text) throw new Error(`${options.label} prompt returned no text.`);
+    return text;
+  } finally {
+    await typed.session.abort?.(pathOnly(sessionID)).catch(() => undefined);
+  }
 }
 
 export function lastAssistantTurn(messages: SessionTurn[]) {
@@ -194,6 +235,16 @@ export function tokenTotal(tokens?: SessionTokens) {
   );
 }
 
+export function parseModelRef(spec: string) {
+  const parts = spec.split("/").map((item) => item.trim()).filter(Boolean);
+  if (parts.length < 2) return undefined;
+  return {
+    providerID: parts[0]!,
+    id: parts[1]!,
+    variant: parts[2],
+  };
+}
+
 export function childrenAreBusy(
   children: SessionChild[],
   statuses: Record<string, { type?: string } | string>,
@@ -212,7 +263,9 @@ export function isGoalRuntimePrompt(text: string) {
     text.startsWith("Continue working toward the persisted thread goal.") ||
     text.startsWith("Continue working toward the active thread goal.") ||
     text.startsWith("A persisted thread goal is now active.") ||
-    text.startsWith("The active thread goal has reached its token budget.");
+    text.startsWith("The active thread goal has reached its token budget.") ||
+    text.startsWith("The active thread goal has reached a safety limit.") ||
+    text.startsWith("OpenCode goal mode policy:");
 }
 
 export function isAbortError(error: unknown) {
@@ -234,17 +287,23 @@ export async function httpJudge(input: {
   prompt: string;
   model?: { id: string; providerID: string; variant?: string };
   fetch?: HttpJudgeFetch;
+  title?: string;
+  tools?: Record<string, boolean>;
+  timeoutMs?: number;
 }) {
   const request = input.fetch ?? ((url, init) => fetch(url, init));
   const root = input.baseUrl.replace(/\/$/, "");
   const query = input.directory
     ? `?directory=${encodeURIComponent(input.directory)}`
     : "";
+  const signal = input.timeoutMs
+    ? AbortSignal.timeout(input.timeoutMs)
+    : undefined;
   const created = await fetchJson(request, `${root}/session${query}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      title: "goal-judge",
+      title: input.title ?? "goal-judge",
       model: input.model
         ? {
           id: input.model.id,
@@ -253,6 +312,7 @@ export async function httpJudge(input: {
         }
         : undefined,
     }),
+    signal,
   });
   const sessionID = createdSessionID(created);
   if (!sessionID) {
@@ -266,9 +326,10 @@ export async function httpJudge(input: {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          tools: { "*": false },
+          tools: input.tools ?? { "*": false },
           parts: [{ type: "text", text: input.prompt }],
         }),
+        signal,
       },
     );
     const text = textFromParts(promptParts(response));
@@ -277,6 +338,7 @@ export async function httpJudge(input: {
   } finally {
     await request(`${root}/session/${sessionID}/abort${query}`, {
       method: "POST",
+      signal,
     }).catch(() => undefined);
   }
 }
@@ -312,15 +374,16 @@ async function fetchJson(
 async function createJudgeSession(
   client: PluginSessionClient,
   model?: { id: string; providerID: string; variant?: string },
+  title = "goal-judge",
 ) {
   const create = bind(client.session, "create");
   if (!create) {
     throw new Error("OpenCode session.create is unavailable for the judge.");
   }
   const attempts = [
-    { body: { title: "goal-judge", model } },
-    { title: "goal-judge", model },
-    { path: {}, body: { title: "goal-judge", model } },
+    { body: { title, model } },
+    { title, model },
+    { path: {}, body: { title, model } },
   ];
   let last = "Judge session could not be created.";
   for (const input of attempts) {

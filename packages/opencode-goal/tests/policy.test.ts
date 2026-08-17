@@ -3,7 +3,7 @@ import {
   decideContinuation,
   shouldSuppressNextContinuation,
 } from "../src/policy.ts";
-import type { Goal } from "../src/types.ts";
+import { defaultGoalFields, type Goal } from "../src/types.ts";
 
 const goal = (status: Goal["status"], extra: Partial<Goal> = {}): Goal => ({
   sessionID: "ses",
@@ -19,6 +19,7 @@ const goal = (status: Goal["status"], extra: Partial<Goal> = {}): Goal => ({
   noToolStreak: 0,
   createdAt: 1,
   updatedAt: 1,
+  ...defaultGoalFields(),
   ...extra,
 });
 
@@ -33,6 +34,7 @@ const base = {
   promptFailures: 0,
   maxPromptFailures: 3,
   noToolTurnsBeforeSuppress: 2,
+  wrapupRatio: 0.8,
 };
 
 test("continues an idle active goal", () => {

@@ -6,6 +6,8 @@ import type { Goal } from "./types.ts";
 export type EvidenceClaim = {
   summary?: string;
   evidence?: string;
+  criteria?: Array<{ criterion?: string; evidence?: string[] }>;
+  checks?: Array<{ command?: string; result?: string }>;
 };
 
 export type HostCheckResult = {
@@ -23,7 +25,12 @@ export type CompletionAudit = {
 };
 
 export function inspectClaim(goal: Goal, claim: EvidenceClaim): CompletionAudit {
-  const evidence = (claim.evidence ?? claim.summary ?? "").trim();
+  void goal;
+  const failed = (claim.checks ?? []).find((item) => item.result === "failed");
+  if (failed) {
+    return fail(`Completion cannot include a failed check: ${failed.command ?? "unnamed"}.`);
+  }
+  const evidence = serializeClaim(claim);
   if (!evidence) {
     return fail("Completion requires concrete evidence, not an empty claim.");
   }
@@ -36,6 +43,20 @@ export function inspectClaim(goal: Goal, claim: EvidenceClaim): CompletionAudit 
     checks: [],
     citedFiles: citedFiles(evidence),
   };
+}
+
+export function serializeClaim(claim: EvidenceClaim) {
+  const lines = [
+    claim.summary?.trim(),
+    claim.evidence?.trim(),
+    ...(claim.criteria ?? []).flatMap((item) => {
+      const criterion = item.criterion?.trim();
+      const evidence = (item.evidence ?? []).map((value) => value.trim()).filter(Boolean);
+      if (!criterion || evidence.length === 0) return [];
+      return [`${criterion}: ${evidence.join("; ")}`];
+    }),
+  ].filter(Boolean);
+  return lines.join("\n");
 }
 
 export async function auditCompletion(

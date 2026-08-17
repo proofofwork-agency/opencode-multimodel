@@ -11,18 +11,29 @@ async function setup(input: {
   evaluate?: JudgeResult;
   children?: Array<{ id: string }>;
   statuses?: Record<string, { type?: string }>;
+  agent?: string;
+  options?: Record<string, unknown>;
+  promptOutputTokens?: number;
+  directory?: string;
 } = {}) {
-  const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
+  const directory = input.directory ?? await mkdtemp(join(tmpdir(), "opencode-goal-"));
   const prompts: string[] = [];
+  const synthetic: boolean[] = [];
   const aborted: string[] = [];
   const client = {
     busy: false,
-    async prompt(request: { sessionID: string; text: string }) {
+    async prompt(request: { sessionID: string; text: string; synthetic?: boolean }) {
       prompts.push(request.text);
-      return { text: "working", hadTools: true, tokens: 20 };
+      synthetic.push(request.synthetic === true);
+      return {
+        text: "working",
+        hadTools: true,
+        tokens: 20,
+        outputTokens: input.promptOutputTokens,
+      };
     },
     async session() {
-      return { busy: client.busy };
+      return { busy: client.busy, agent: input.agent };
     },
     async abort(sessionID: string) {
       aborted.push(sessionID);
@@ -40,6 +51,7 @@ async function setup(input: {
       databasePath: join(directory, "goal.sqlite"),
       snapshotDir: join(directory, "goals"),
       minDelayMs: 0,
+      ...input.options,
     }),
     directory,
     client,
@@ -50,16 +62,21 @@ async function setup(input: {
       code: 0,
       output: "ok",
     }),
+    runDogfood: async () => ({
+      verdict: "pass" as const,
+      reason: "Dogfood run passed.",
+      output: "ok",
+    }),
     evaluate: async () => input.evaluate ?? {
       verdict: "not_met",
       reason: "still working",
     },
   });
-  return { directory, prompts, aborted, client, service };
+  return { directory, prompts, synthetic, aborted, client, service };
 }
 
 test("sets a goal and starts a work turn", async () => {
-  const { service, prompts } = await setup();
+  const { service, prompts, synthetic } = await setup();
   const status = await service.handleCommand(
     "ses",
     `fix tests --check "npm test" --budget 50k`,
@@ -69,6 +86,8 @@ test("sets a goal and starts a work turn", async () => {
   expect(status).toContain("State: active");
   expect(prompts[0]).toContain("<opencode_goal_receipt>");
   expect(prompts[0]).toContain("<untrusted_objective>");
+  expect(prompts[0]).not.toContain("Codex");
+  expect(synthetic[0]).toBe(true);
   expect(service.get("ses")?.checks).toEqual(["npm test"]);
   service.close();
 });
@@ -160,15 +179,16 @@ test("skips continuation while child sessions are busy", async () => {
   service.close();
 });
 
-test("skips continuation when another user prompt is queued", async () => {
+test("pauses when the user sends a message", async () => {
   const { service } = await setup();
   await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
     start: false,
   });
   service.noteHumanMessage("ses", "also fix types");
-  service.noteHumanMessage("ses", "and the docs");
+  expect(service.get("ses")?.status).toBe("paused");
+  expect(service.get("ses")?.pauseReason).toBe("user");
   const decision = await service.handleIdle("ses");
-  expect(decision).toEqual({ action: "skip", reason: "user-queued" });
+  expect(decision).toEqual({ action: "skip", reason: "paused" });
   service.close();
 });
 
@@ -187,6 +207,11 @@ test("fails closed when a host check fails", async () => {
       code: 1,
       output: "fail",
     }),
+    runDogfood: async ({ command }) => ({
+      verdict: command === "validate" ? "pass" as const : "fail" as const,
+      reason: command === "validate" ? "Dogfood validate passed." : "Host check failed",
+      output: "fail",
+    }),
     evaluate: async () => ({ verdict: "met", reason: "worker said done" }),
   });
   await service.apply("ses", {
@@ -202,9 +227,8 @@ test("fails closed when a host check fails", async () => {
   service.close();
 });
 
-test("steers a busy session by aborting the live turn then starting the goal", async () => {
-  const { service, client, aborted, prompts } = await setup();
-  client.busy = true;
+test("steers a session by aborting any live turn so /goal does not wait in the queue", async () => {
+  const { service, aborted, prompts } = await setup();
   await service.apply("ses", { action: "set", objective: "take over", checks: [] });
   expect(aborted).toEqual(["ses"]);
   expect(prompts.at(-1)).toContain("take over");
@@ -238,7 +262,7 @@ test("reopening an active goal continues the runtime", async () => {
   service.close();
 });
 
-test("recoverActive continues every stored active goal", async () => {
+test("recoverActive continues stored active goals after a crash", async () => {
   const { service, prompts } = await setup();
   await service.apply("ses-a", { action: "set", objective: "one", checks: [] }, {
     start: false,
@@ -246,9 +270,195 @@ test("recoverActive continues every stored active goal", async () => {
   await service.apply("ses-b", { action: "set", objective: "two", checks: [] }, {
     start: false,
   });
+  await service.apply("ses-c", { action: "set", objective: "paused by user", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses-c", { action: "pause" }, { start: false });
   await service.recoverActive();
   expect(prompts.some((text) => text.includes("one"))).toBe(true);
   expect(prompts.some((text) => text.includes("two"))).toBe(true);
+  expect(service.get("ses-a")?.status).toBe("active");
+  expect(service.get("ses-b")?.status).toBe("active");
+  expect(service.get("ses-c")?.status).toBe("paused");
+  expect(service.get("ses-c")?.pauseReason).toBe("user");
+  service.close();
+});
+
+test("recoverActive resumes leftover crash pauses and snapshot-only goals", async () => {
+  const { directory, service, prompts } = await setup();
+  await service.apply("ses-live", { action: "set", objective: "live", checks: [] }, {
+    start: false,
+  });
+  const live = service.get("ses-live")!;
+  service.store.update("ses-live", live.goalID, {
+    status: "paused",
+    pauseReason: "recovery",
+  });
+  const orphanDir = join(directory, "goals");
+  await mkdir(orphanDir, { recursive: true });
+  await writeFile(
+    join(orphanDir, "ses_orphan.json"),
+    `${JSON.stringify({
+      version: 1,
+      sessionID: "ses_orphan",
+      goalID: "g-orphan",
+      objective: "orphan snapshot",
+      status: "active",
+      checks: [],
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      turns: 0,
+      autoTurns: 0,
+      completable: false,
+      updatedAt: Date.now(),
+    })}\n`,
+  );
+  await service.recoverActive();
+  expect(service.get("ses-live")?.status).toBe("active");
+  expect(service.get("ses_orphan")?.status).toBe("active");
+  expect(prompts.some((text) => text.includes("live"))).toBe(true);
+  expect(prompts.some((text) => text.includes("orphan snapshot"))).toBe(true);
+  service.close();
+});
+
+test("creates plan-mode goals paused and refuses resume", async () => {
+  const { service } = await setup();
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+    agent: "plan",
+  });
+  expect(service.get("ses")?.status).toBe("paused");
+  expect(service.get("ses")?.pauseReason).toBe("plan");
+  await expect(service.apply("ses", { action: "resume" }, { agent: "plan" }))
+    .rejects.toThrow("Plan mode");
+  service.close();
+});
+
+test("can disable dogfood on a goal and skip the contract gate", async () => {
+  const { service } = await setup();
+  await service.apply("ses", {
+    action: "set",
+    objective: "ship",
+    checks: ["npm test"],
+    dogfood: false,
+  }, { start: false });
+  expect(service.get("ses")?.dogfood).toBe(false);
+  expect(service.get("ses")?.contractPath).toBeUndefined();
+  const status = await service.apply("ses", { action: "dogfood" });
+  expect(status).toContain("Dogfood: off");
+  await service.apply("ses", { action: "dogfood", enabled: true }, { start: false });
+  expect(service.get("ses")?.dogfood).toBe(true);
+  expect(service.get("ses")?.contractPath).toBeDefined();
+  service.close();
+});
+
+test("records unmet with a concrete blocker", async () => {
+  const { service } = await setup();
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+  });
+  await service.markUnmet("ses", "Need the production API token.");
+  expect(service.get("ses")?.status).toBe("unmet");
+  expect(service.get("ses")?.blocker).toContain("API token");
+  service.close();
+});
+
+test("refuses unmet on terminal goals", async () => {
+  const { service } = await setup();
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+  });
+  await service.markUnmet("ses", "Need the production API token.");
+  await expect(service.markUnmet("ses", "Changed my mind about this goal."))
+    .rejects.toThrow("cannot be marked unmet");
+  service.close();
+});
+
+test("pauses after repeated low-output continuation turns only when output tokens are known", async () => {
+  const low = await setup({ promptOutputTokens: 3 });
+  await low.service.apply("ses", {
+    action: "set",
+    objective: "ship",
+    checks: [],
+  }, { start: false });
+  await low.service.maybeContinue("ses");
+  expect(low.service.get("ses")?.status).toBe("active");
+  expect(low.service.get("ses")?.noProgressStreak).toBe(1);
+  await low.service.maybeContinue("ses");
+  expect(low.service.get("ses")?.status).toBe("paused");
+  expect(low.service.get("ses")?.pauseReason).toBe("no_progress");
+  expect((await low.service.maybeContinue("ses")).action).toBe("skip");
+  low.service.close();
+
+  const unknown = await setup();
+  await unknown.service.apply("ses", {
+    action: "set",
+    objective: "ship",
+    checks: [],
+  }, { start: false });
+  await unknown.service.maybeContinue("ses");
+  await unknown.service.maybeContinue("ses");
+  await unknown.service.maybeContinue("ses");
+  expect(unknown.service.get("ses")?.status).toBe("active");
+  expect(unknown.service.get("ses")?.noProgressStreak).toBe(0);
+  unknown.service.close();
+});
+
+test("recoverActive honors autoResumeInterrupted=false", async () => {
+  const { service } = await setup({
+    options: { autoResumeInterrupted: false },
+  });
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+  });
+  await service.handleInterrupt("ses");
+  expect(service.get("ses")?.pauseReason).toBe("interrupt");
+  await service.recoverActive();
+  expect(service.get("ses")?.status).toBe("paused");
+  expect(service.get("ses")?.pauseReason).toBe("interrupt");
+  service.close();
+});
+
+test("resolves the plan agent from the session when the caller omits it", async () => {
+  const { service } = await setup({ agent: "plan" });
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+  });
+  expect(service.get("ses")?.status).toBe("paused");
+  expect(service.get("ses")?.pauseReason).toBe("plan");
+  await expect(service.apply("ses", { action: "resume" }, { start: false }))
+    .rejects.toThrow("Plan mode");
+  service.close();
+});
+
+test("pins continuation prompts to the agent that started the goal", async () => {  const prompts: Array<Record<string, unknown>> = [];
+  const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
+  const client = {
+    async prompt(request: Record<string, unknown>) {
+      prompts.push(request);
+      return { text: "working", hadTools: true, tokens: 20 };
+    },
+    async session() {
+      return {};
+    },
+  };
+  const service = new GoalService({
+    ...parseOptions({
+      databasePath: join(directory, "goal.sqlite"),
+      snapshotDir: join(directory, "goals"),
+      minDelayMs: 0,
+    }),
+    directory,
+    client,
+    now: () => 1_000,
+    evaluate: async () => ({ verdict: "not_met", reason: "working" }),
+  });
+  await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+    start: false,
+    agent: "build",
+  });
+  await service.maybeContinue("ses");
+  expect(prompts.at(-1)?.agent).toBe("build");
   service.close();
 });
 
@@ -262,5 +472,159 @@ test("auto-pauses on interrupt and can resume", async () => {
   expect(service.get("ses")?.pauseReason).toBe("interrupt");
   await service.handleResume("ses");
   expect(service.get("ses")?.status).toBe("active");
+  service.close();
+});
+
+test("a second process is passive while the owner holds the session", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
+  const owner = await setup({ directory });
+  const passive = await setup({ directory });
+  await owner.service.apply("ses", { action: "set", objective: "own it", checks: [] }, {
+    start: false,
+  });
+
+  await expect(
+    passive.service.apply("ses", { action: "set", objective: "steal", checks: [] }, {
+      start: false,
+    }),
+  ).rejects.toThrow("owns this session's goal");
+  expect((await passive.service.handleIdle("ses")))
+    .toMatchObject({ action: "skip", reason: "session-owned-elsewhere" });
+  expect((await passive.service.maybeContinue("ses")))
+    .toMatchObject({ action: "skip", reason: "session-owned-elsewhere" });
+  passive.service.noteHumanMessage("ses", "hello from the passive process");
+  expect(owner.service.get("ses")?.status).toBe("active");
+
+  // Reads stay available to the passive process.
+  expect(await passive.service.apply("ses", { action: "status" }, { start: false }))
+    .toContain("own it");
+
+  await owner.service.apply("ses", { action: "clear" }, { start: false });
+  await passive.service.apply("ses", { action: "set", objective: "mine now", checks: [] }, {
+    start: false,
+  });
+  expect(passive.service.get("ses")?.objective).toBe("mine now");
+  owner.service.close();
+  passive.service.close();
+});
+
+test("recoverActive leaves live-owned sessions to their owner", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
+  const owner = await setup({ directory });
+  const second = await setup({ directory });
+  await owner.service.apply("ses", { action: "set", objective: "owned", checks: [] }, {
+    start: false,
+  });
+  await second.service.recoverActive();
+  expect(second.prompts).toEqual([]);
+  expect(owner.service.get("ses")?.status).toBe("active");
+  owner.service.close();
+  second.service.close();
+});
+
+test("add backgrounds the focused goal and focuses the new one", async () => {
+  const { service, prompts } = await setup();
+  await service.apply("ses", { action: "set", objective: "first goal", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses", { action: "add", objective: "second goal", checks: [] }, {
+    start: false,
+  });
+  const goals = service.store.listForSession("ses");
+  expect(goals).toHaveLength(2);
+  expect(service.get("ses")?.objective).toBe("second goal");
+  expect(goals[0]?.status).toBe("paused");
+  expect(goals[0]?.focused).toBe(false);
+  expect(goals[1]?.focused).toBe(true);
+  await service.maybeContinue("ses");
+  expect(prompts.at(-1)).toContain("second goal");
+  const list = await service.apply("ses", { action: "list" }, { start: false });
+  expect(list).toContain("1. first goal");
+  expect(list).toContain("2. second goal");
+  service.close();
+});
+
+test("focus switches the active goal by list number", async () => {
+  const { service, prompts } = await setup();
+  await service.apply("ses", { action: "set", objective: "alpha", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses", { action: "add", objective: "beta", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses", { action: "focus", index: 1 }, { start: false });
+  expect(service.get("ses")?.objective).toBe("alpha");
+  expect(service.get("ses")?.status).toBe("active");
+  await service.maybeContinue("ses");
+  expect(prompts.at(-1)).toContain("alpha");
+  service.close();
+});
+
+test("set replaces only the focused goal", async () => {
+  const { service } = await setup();
+  await service.apply("ses", { action: "set", objective: "keep me", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses", { action: "add", objective: "replace me", checks: [] }, {
+    start: false,
+  });
+  await service.apply("ses", { action: "set", objective: "fresh goal", checks: [] }, {
+    start: false,
+  });
+  const goals = service.store.listForSession("ses");
+  expect(goals.map((goal) => goal.objective)).toEqual([
+    "keep me",
+    "fresh goal",
+  ]);
+  expect(service.get("ses")?.objective).toBe("fresh goal");
+  service.close();
+});
+
+test("sequence queues goals and promotes the next on completion", async () => {
+  const bench = await setup({
+    evaluate: { verdict: "met", reason: "done" },
+  });
+  await writeFile(join(bench.directory, "parser.ts"), "export {}\n");
+  await service_apply_sequence(bench.service);
+  const queued = bench.service.store.listForSession("ses");
+  expect(queued).toHaveLength(2);
+  expect(bench.service.get("ses")?.objective).toBe("build the parser");
+  expect(queued[1]?.status).toBe("paused");
+  expect(queued[1]?.pauseReason).toBe("queued");
+  expect(queued[1]?.focused).toBe(false);
+
+  const result = await bench.service.completeFromModel("ses", {
+    evidence: "Built parser.ts and verified the exports load cleanly.",
+  });
+  expect(result.approved).toBe(true);
+  expect(result.reason).toContain("promoted");
+  const after = bench.service.store.listForSession("ses");
+  expect(after[0]?.status).toBe("complete");
+  expect(bench.service.get("ses")?.objective).toBe("write the tests");
+  expect(bench.service.get("ses")?.status).toBe("active");
+  expect(bench.prompts.some((text) => text.includes("write the tests")))
+    .toBe(true);
+  bench.service.close();
+});
+
+async function service_apply_sequence(service: import("../src/engine.ts").GoalService) {
+  await service.apply(
+    "ses",
+    { action: "sequence", objectives: ["build the parser", "write the tests"] },
+    { start: false },
+  );
+}
+
+test("recovery ignores queued sequence items", async () => {
+  const { service } = await setup();
+  await service.apply(
+    "ses",
+    { action: "sequence", objectives: ["one", "two"] },
+    { start: false },
+  );
+  await service.recoverActive();
+  const goals = service.store.listForSession("ses");
+  expect(goals[1]?.status).toBe("paused");
+  expect(goals[1]?.pauseReason).toBe("queued");
   service.close();
 });

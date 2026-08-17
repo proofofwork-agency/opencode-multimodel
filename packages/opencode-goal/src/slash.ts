@@ -13,7 +13,8 @@ export function sessionLooksBusy(status: unknown): boolean {
 }
 
 export function shouldStartGoalTurn(action: string): boolean {
-  return action === "set" || action === "resume";
+  return action === "set" || action === "add" || action === "resume" ||
+    action === "edit" || action === "focus" || action === "sequence";
 }
 
 export function shouldSteerLiveTurn(action: string, busy: boolean): boolean {
