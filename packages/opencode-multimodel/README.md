@@ -23,8 +23,8 @@ only OpenCode's public plugin and SDK APIs.
 - `/collab` interactively selects `lead`, `pair`, `round`, `council`,
   `orchestrate`, `handoff`, `panel`, `deliberate`, or `jury`, then prefills the
   native session composer so the request and result stay in the normal chat.
-- `/workflow` starts a Claude Code-style dynamic workflow for a task, or runs
-  a saved DAG or confined script when you name one.
+- `/workflow` starts a dynamic workflow for a task, or runs a saved DAG or
+  confined script when you name one.
 - An active `opencode-goal` on the parent session is injected into child
   prompts. Goal continuation waits while a workflow or collaboration is
   running so the two loops do not fight.
@@ -35,7 +35,7 @@ only OpenCode's public plugin and SDK APIs.
 - `/workflows` is a nested board: active runs on the left, compact task
   tiles next to them, and the executing prompt/result as the main pane.
   That pane always follows the seat that is working. The session composer
-  shows a Claude-style running line and checklist
+  shows a running line and checklist
   (`✻ Running dynamic · change/session · 48s` / `✓ understand ● change ○ verify`)
   at the bottom of the chat. A toast still reports step changes and a
   heartbeat every ~20s. `/runs` and `/graph` still expose the ledger and

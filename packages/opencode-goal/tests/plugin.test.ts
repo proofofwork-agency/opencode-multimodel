@@ -12,7 +12,7 @@ test("publishes separate server and TUI modules", () => {
   expect(typeof tuiModule.tui).toBe("function");
 });
 
-test("server plugin registers Codex-style goal tools and handles /goal before the model", async () => {
+test("server plugin registers goal tools and handles /goal before the model", async () => {
   const directory = await mkdtemp(join(tmpdir(), "opencode-goal-"));
   const plugin = await serverModule.server({
     directory,

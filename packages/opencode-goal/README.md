@@ -1,51 +1,27 @@
 # opencode-goal
 
-Codex-style persisted `/goal` for original [OpenCode](https://github.com/anomalyco/opencode).
+Persisted `/goal` for [OpenCode](https://github.com/anomalyco/opencode).
 
 Current prerelease: **`0.2.0-alpha.0`**, validated with OpenCode **1.18.15**.
 
-This is a thread-scoped completion contract, not a longer prompt. One goal belongs
-to one OpenCode session. The plugin keeps that objective across turns, compaction,
-interrupts, workflow children, and Codex-delegate seats, and it only marks the
-goal complete after an evidence audit.
-
-It is independently implemented. “Codex-style” describes the runtime contract,
-not a Codex CLI wrapper and not an OpenAI endorsement.
-
-## What it copies from Codex
-
-Codex `/goal` is a five-layer runtime. This plugin mirrors those layers on
-OpenCode’s public plugin API:
-
-| Codex layer | This plugin |
-| --- | --- |
-| SQLite `thread_goals` with `active` / `paused` / `budget_limited` / `complete` | `.opencode/goal.sqlite` |
-| `goal_id` stale-update protection | Replacing a goal mints a new `goalID`; old accounting is dropped |
-| Model tools `create_goal`, `update_goal(complete)`, `get_goal` | Same names and the same authority split |
-| User/system pause, resume, clear, budget | `/goal` plus `goal_control` |
-| Idle continuation + no-tool suppression | `session.idle` with the same skip rules |
-| Interrupt pauses, resume reactivates | `session.error` / session resume |
-| `continuation.md` and `budget_limit.md` | Host-owned prompts with an untrusted-objective fence |
-| Token budget accounting | Optional `--budget`; crossing it is `budget_limited` |
+`/goal` is a thread-scoped completion contract, not a longer prompt. One goal
+belongs to one OpenCode session. The plugin keeps that objective across turns,
+compaction, and interrupts, and it only marks the goal complete after an
+evidence audit.
 
 The model can start a goal and propose completion. It cannot pause, resume, or
 change the budget. Pause is user or interrupt. Resume is explicit or interrupt
-recovery. Budget-limit is accounting. Completion is fail-closed: a host check
-or a cited existing file, plus an independent small-model verdict of `met`.
-The judge can also return `impossible`, which is a terminal stop.
-
-OpenCode still has no in-loop Stop hook, so continuation is event-driven on
-`session.idle`, matching Codex’s `MaybeContinueIfIdle` rather than Claude’s
-Stop-hook re-entry.
+recovery. Crossing a token budget is `budget_limited`. Completion is
+fail-closed: a host check or a cited existing file, plus an independent
+small-model verdict of `met`. The judge can also return `impossible`, which
+is a terminal stop.
 
 ## Install
 
 ```json
 {
   "plugin": [
-    "opencode-goal@alpha",
-    "opencode-multimodel@alpha",
-    "opencode-codex-delegate@alpha"
+    "opencode-goal@alpha"
   ]
 }
 ```
@@ -101,7 +77,7 @@ It stops when:
 - token usage reaches `--budget` (`budget_limited`)
 - you `/goal pause` or `/goal clear`
 - two continuation turns in a row make no tool calls
-- a multimodel workflow/collaboration is running, or any child session is busy
+- a child session is busy
 - the session is in plan mode
 - another user prompt is already queued
 - three prompt failures occur
@@ -125,18 +101,6 @@ Completion also requires host proof:
 
 Passing tests in prose, a todo list, or elapsed effort are not enough.
 
-## Workflows and Codex delegate
-
-The plugin does not nest a second `/goal` inside Codex.
-
-- **opencode-multimodel**: while a workflow or collaboration is `pending`,
-  `running`, or `paused` on the session, goal continuation waits. Child fleet
-  prompts receive the parent goal as an untrusted objective. Child sessions
-  cannot call `create_goal` / `update_goal` / `goal_control`.
-- **opencode-codex-delegate**: delegate turns and provider-model calls prepend
-  the same parent goal and tell Codex not to start CLI `/goal`. The OpenCode
-  goal remains the outer loop.
-
 Other plugins can read `.opencode/goals/<sessionID>.json` without importing
 this package.
 
@@ -148,7 +112,6 @@ this package.
   {
     "databasePath": ".opencode/goal.sqlite",
     "snapshotDir": ".opencode/goals",
-    "multimodelDatabasePath": ".opencode/multimodel.sqlite",
     "minDelayMs": 1500,
     "maxPromptFailures": 3,
     "autoResumeInterrupted": true,

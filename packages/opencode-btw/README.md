@@ -1,7 +1,6 @@
 # opencode-btw
 
-Ephemeral `/btw` side questions for [OpenCode](https://opencode.ai), modeled
-after Claude Code's `/btw` and Codex's `/side`.
+Ephemeral `/btw` side questions for [OpenCode](https://opencode.ai).
 
 ```json
 {
@@ -63,4 +62,4 @@ Invalid values fall back to defaults; unknown keys are ignored.
   and known plugin tools, denies permissions, and is capped at one step.
 - The parent session's storage is never written; cleanup is enforced by
   finally-delete, abort handlers, `session.deleted` hygiene, and `dispose()`.
-- Nothing persists across restarts by design (Claude terminal semantics).
+- Nothing persists across restarts by design.

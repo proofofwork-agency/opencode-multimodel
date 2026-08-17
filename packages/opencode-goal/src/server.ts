@@ -29,7 +29,7 @@ const server: Plugin = async (input, rawOptions) => {
       config.command ??= {};
       config.command.goal ??= {
         description:
-          "Set or manage a persisted Codex-style goal that continues until evidence says it is done",
+          "Set or manage a persisted goal that continues until evidence says it is done",
         template: "$ARGUMENTS",
       };
     },
