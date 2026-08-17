@@ -128,6 +128,36 @@ describe("SQLite orchestration state", () => {
     expect(state.events).toHaveLength(5);
     expect(state.runs.find((item) => item.id === "active")).toBeDefined();
   });
+
+  test("lists agent calls with model, prompt, and output for the board", async () => {
+    const store = opened(await databasePath());
+    await store.createRun(run("workflow_board", "session", "message"), "tool");
+    await store.saveAgentCall({
+      runID: "workflow_board",
+      stepID: "understand",
+      callIndex: 0,
+      memberID: "session",
+      prompt: "Explore the repository",
+      options: {
+        model: { providerID: "xai", modelID: "grok-4.6" },
+        agent: "build",
+      },
+      status: "completed",
+      sessionID: "child",
+      output: "Look at src/tui.tsx",
+    });
+    const calls = await store.listAgentCalls("workflow_board");
+    expect(calls).toEqual([{
+      stepID: "understand",
+      memberID: "session",
+      prompt: "Explore the repository",
+      status: "completed",
+      output: "Look at src/tui.tsx",
+      error: undefined,
+      model: "xai/grok-4.6",
+    }]);
+    expect(await store.listAgentCalls("missing")).toEqual([]);
+  });
 });
 
 function opened(

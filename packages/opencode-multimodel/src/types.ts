@@ -160,9 +160,26 @@ export type ScriptWorkflowDefinition = {
   sourceHash?: string;
 };
 
+export type ModuleWorkflowDefinition = {
+  kind: "module";
+  name: string;
+  description?: string;
+  whenToUse?: string;
+  phases?: Array<string | { title: string; detail?: string; model?: string }>;
+  arguments?: Record<string, {
+    type?: "string" | "number" | "boolean";
+    default?: unknown;
+    description?: string;
+  }>;
+  path: string;
+  source: string;
+  sourceHash?: string;
+};
+
 export type WorkflowDefinition =
   | DagWorkflowDefinition
-  | ScriptWorkflowDefinition;
+  | ScriptWorkflowDefinition
+  | ModuleWorkflowDefinition;
 
 export type WorkflowStepRun = {
   id: string;
@@ -194,7 +211,7 @@ export type WorkflowRun = {
   id: string;
   kind: "workflow";
   definition: string;
-  workflowKind: "dag" | "script";
+  workflowKind: "dag" | "script" | "module";
   sessionID: string;
   messageID?: string;
   input: string;
@@ -237,6 +254,9 @@ export type WorkflowRunOptions = {
   maxAgentCalls?: number;
   maxParallel?: number;
   timeoutMs?: number;
+  seatTimeoutMs?: number;
+  sessionModel?: ModelRef;
+  sessionAgent?: string;
   beforeStep?: (run: WorkflowRun) => void | Promise<void>;
   onUpdate?: (run: WorkflowRun) => void | Promise<void>;
 };
@@ -271,7 +291,25 @@ export type PersistedState = {
 export function isDagWorkflow(
   definition: WorkflowDefinition,
 ): definition is DagWorkflowDefinition {
-  return definition.kind !== "script";
+  return definition.kind === undefined || definition.kind === "dag";
+}
+
+export function isScriptWorkflow(
+  definition: WorkflowDefinition,
+): definition is ScriptWorkflowDefinition {
+  return definition.kind === "script";
+}
+
+export function isModuleWorkflow(
+  definition: WorkflowDefinition,
+): definition is ModuleWorkflowDefinition {
+  return definition.kind === "module";
+}
+
+export function workflowSource(definition: WorkflowDefinition) {
+  return definition.kind === "script" || definition.kind === "module"
+    ? definition.source
+    : undefined;
 }
 
 export function isWorkflowRun(run: DurableRun): run is WorkflowRun {

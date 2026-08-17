@@ -55,6 +55,13 @@ describe("native composer routing", () => {
     expect(team.parts).toBe(prompt.parts);
     expect(workflow.input).toBe("/workflow release Review this");
     expect(workflow.parts).toBe(prompt.parts);
+    expect(routeComposerPrompt(
+      prompt,
+      { mode: "workflow", collaborationMode: "council" },
+      false,
+      workflows,
+      "council",
+    ).input).toBe("/workflow Review this");
   });
 
   test("never rewrites shell, slash-command, or @ input", () => {

@@ -5,8 +5,10 @@ import { join } from "node:path";
 import {
   asOpenCodeClient,
   discoverFleet,
+  extractReplyText,
   listAvailableFleetModels,
   OpenCodeAgentRunner,
+  resolveSessionSelection,
 } from "../src/opencode.ts";
 import { StateStore } from "../src/state.ts";
 import type { FleetMember } from "../src/types.ts";
@@ -141,6 +143,32 @@ describe("OpenCode child-session adapter", () => {
     ]);
     expect(discovered.members[0]?.model.modelID).toBe("gpt-codex");
     expect(discovered.members[2]?.model.modelID).toBe("grok");
+    expect(discovered.members.every((item) => item.agent === undefined)).toBe(true);
+
+    expect(await resolveSessionSelection(asOpenCodeClient({
+      session: {
+        async create() {
+          return { data: { id: "unused" } };
+        },
+        async prompt() {
+          return { data: { parts: [] } };
+        },
+        async abort() {
+          return { data: true };
+        },
+        async get() {
+          return {
+            data: {
+              agent: "build",
+              model: { providerID: "xai", id: "grok-4.6" },
+            },
+          };
+        },
+      },
+    }), "parent")).toEqual({
+      agent: "build",
+      model: { providerID: "xai", modelID: "grok-4.6" },
+    });
 
     const available = await listAvailableFleetModels(client);
     expect(available.map((item) =>
@@ -326,5 +354,16 @@ describe("OpenCode child-session adapter", () => {
     expect((await store.listWorkspaces("run-a")).map((item) => item.status))
       .toEqual(["removed", "preserved"]);
     await store.close();
+  });
+
+  test("extracts text from nested and reasoning-shaped OpenCode replies", () => {
+    expect(extractReplyText({
+      parts: [{ type: "text", text: "hello" }],
+    })).toBe("hello");
+    expect(extractReplyText({
+      info: { content: [{ type: "reasoning", text: "thinking" }] },
+      parts: [{ type: "output", content: "done" }],
+    })).toBe("done\nthinking");
+    expect(extractReplyText({ parts: [] })).toBe("");
   });
 });

@@ -3,8 +3,14 @@ import { basename, isAbsolute, resolve } from "node:path";
 import type { MultiModelOptions } from "./options.ts";
 import { validateWorkflowScript } from "./script.ts";
 import type { StateStore } from "./state.ts";
+import { workflowSourceHash } from "./state.ts";
 import type { WorkflowDefinition } from "./types.ts";
 import { validateWorkflow } from "./workflow.ts";
+import {
+  extractWorkflowMeta,
+  isModuleWorkflowSource,
+  validateModuleWorkflowSource,
+} from "./workflow-meta.ts";
 
 export async function loadWorkflowDirectories(
   store: StateStore,
@@ -31,14 +37,30 @@ export async function loadWorkflowDirectories(
       if (definition.kind === "script") {
         if (!options.scripts) continue;
         definition.sourceHash = validateWorkflowScript(definition.source).sourceHash;
-      } else {
+      } else if (definition.kind !== "module") {
         validateWorkflow(definition);
       }
       await store.saveWorkflow(definition);
       continue;
     }
-    if (!options.scripts) continue;
     const source = await Bun.file(file).text();
+    if (isModuleWorkflowSource(source)) {
+      validateModuleWorkflowSource(source);
+      const meta = extractWorkflowMeta(source);
+      await store.saveWorkflow({
+        kind: "module",
+        name: meta.name ?? basename(file).replace(/\.(?:js|ts)$/, ""),
+        description: meta.description,
+        whenToUse: meta.whenToUse,
+        phases: meta.phases,
+        arguments: meta.arguments,
+        path: file,
+        source,
+        sourceHash: workflowSourceHash(source),
+      });
+      continue;
+    }
+    if (!options.scripts) continue;
     const definition = {
       kind: "script" as const,
       name: scriptName(source) ?? basename(file).replace(/\.(?:js|ts)$/, ""),

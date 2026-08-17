@@ -14,6 +14,16 @@ type ClientResponse<Data> = {
   error?: unknown;
 };
 
+type SessionRecord = {
+  id?: string;
+  agent?: string;
+  model?: {
+    providerID?: string;
+    modelID?: string;
+    id?: string;
+  };
+};
+
 type AgentClient = {
   session: {
     create(input: {
@@ -30,6 +40,7 @@ type AgentClient = {
       parts: Array<{ type: "text"; text: string }>;
     }): Promise<ClientResponse<{ info?: { error?: unknown }; parts: unknown[] }>>;
     abort(input: { sessionID: string }): Promise<ClientResponse<boolean>>;
+    get?(input: { sessionID: string }): Promise<ClientResponse<SessionRecord>>;
   };
   provider?: {
     list(): Promise<ClientResponse<ProviderList>>;
@@ -119,6 +130,11 @@ export function adaptPluginClient(client: OpencodeClient): AgentClient {
       abort(input) {
         return client.session.abort({ path: { id: input.sessionID } });
       },
+      get(input) {
+        const get = client.session.get?.bind(client.session);
+        if (!get) return Promise.resolve({});
+        return get({ path: { id: input.sessionID } });
+      },
     },
     provider: {
       list() {
@@ -178,14 +194,13 @@ export class OpenCodeAgentRunner implements AgentRunner {
           `OpenCode model failed: ${describe(response.data.info.error)}`,
         );
       }
-      const text = (response.data?.parts ?? [])
-        .filter(isTextPart)
-        .map((part) => part.text)
-        .join("\n")
-        .trim();
+      const text = extractReplyText(response.data);
       if (!text) {
+        const hint = extractErrorHint(response.data);
         throw new Error(
-          `OpenCode returned no text for fleet member ${input.member.id}.`,
+          hint
+            ? `OpenCode returned no text for fleet member ${input.member.id}: ${hint}`
+            : `OpenCode returned no text for fleet member ${input.member.id}.`,
         );
       }
       await this.recordCall(
@@ -459,7 +474,6 @@ export async function discoverFleet(client: AgentClient): Promise<Fleet> {
         id,
         role: "specialist",
         model: { providerID: provider.id, modelID },
-        agent: "plan",
         enabled: true,
         isolation: "shared" as const,
       } satisfies FleetMember];
@@ -500,6 +514,50 @@ export async function listAvailableFleetModels(
     );
 }
 
+export async function resolveSessionSelection(
+  client: AgentClient,
+  sessionID: string,
+): Promise<{ model?: ModelRef; agent?: string }> {
+  const get = client.session.get;
+  if (!get || !sessionID) return {};
+  const attempts: unknown[] = [
+    { sessionID },
+    { path: { id: sessionID } },
+    { id: sessionID },
+  ];
+  for (const input of attempts) {
+    try {
+      const response = await get(input as { sessionID: string });
+      const selection = parseSessionSelection(response?.data);
+      if (selection.model || selection.agent) return selection;
+    } catch {
+      continue;
+    }
+  }
+  return {};
+}
+
+function parseSessionSelection(
+  data: unknown,
+): { model?: ModelRef; agent?: string } {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return {};
+  const session = data as SessionRecord;
+  const agent = typeof session.agent === "string" ? session.agent : undefined;
+  const providerID = typeof session.model?.providerID === "string"
+    ? session.model.providerID
+    : undefined;
+  const modelID = typeof session.model?.modelID === "string"
+    ? session.model.modelID
+    : typeof session.model?.id === "string"
+      ? session.model.id
+      : undefined;
+  if (!providerID || !modelID) return { agent };
+  return {
+    model: { providerID, modelID } satisfies ModelRef,
+    agent,
+  };
+}
+
 function sessionKey(input: RunAgentInput) {
   return [
     input.parentSessionID,
@@ -524,10 +582,63 @@ function callOptions(input: RunAgentInput) {
   };
 }
 
-function isTextPart(value: unknown): value is { type: "text"; text: string } {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const part = value as { type?: unknown; text?: unknown };
-  return part.type === "text" && typeof part.text === "string";
+export function extractReplyText(data: unknown) {
+  const chunks: string[] = [];
+  collectText(data, chunks, 0);
+  return [...new Set(chunks)].join("\n").trim();
+}
+
+function collectText(value: unknown, chunks: string[], depth: number) {
+  if (depth > 6 || value == null) return;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text) chunks.push(text);
+    return;
+  }
+  if (typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectText(item, chunks, depth + 1));
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.text === "string") collectText(record.text, chunks, depth + 1);
+  if (typeof record.content === "string") {
+    collectText(record.content, chunks, depth + 1);
+  }
+  if (Array.isArray(record.parts)) collectText(record.parts, chunks, depth + 1);
+  if (Array.isArray(record.content) && record.content !== record.parts) {
+    collectText(record.content, chunks, depth + 1);
+  }
+  if (record.info && record.info !== value) {
+    collectText(record.info, chunks, depth + 1);
+  }
+}
+
+function extractErrorHint(data: unknown) {
+  const chunks: string[] = [];
+  collectError(data, chunks, 0);
+  return [...new Set(chunks)].join(" ").trim();
+}
+
+function collectError(value: unknown, chunks: string[], depth: number) {
+  if (depth > 5 || value == null) return;
+  if (typeof value === "string") return;
+  if (typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectError(item, chunks, depth + 1));
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of ["error", "message", "reason"]) {
+    const item = record[key];
+    if (typeof item === "string" && item.trim()) chunks.push(item.trim());
+  }
+  if (record.error && record.error !== value) {
+    collectError(record.error, chunks, depth + 1);
+  }
+  if (record.info && record.info !== value) {
+    collectError(record.info, chunks, depth + 1);
+  }
 }
 
 function describe(value: unknown) {

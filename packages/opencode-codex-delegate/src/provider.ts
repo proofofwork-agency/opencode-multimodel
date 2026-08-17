@@ -76,10 +76,12 @@ class CodexDelegateLanguageModel implements LanguageModelV3 {
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3GenerateResult> {
     const result = await this.run(options);
+    requireCompletedTurn(result);
     const reasoning = result.events
       .filter((event) => event.kind === "reasoning" && event.text)
       .map((event) => event.text)
       .join("");
+    const output = result.output || "Codex completed without text output.";
     return {
       content: [
         ...(reasoning
@@ -90,14 +92,10 @@ class CodexDelegateLanguageModel implements LanguageModelV3 {
               },
             ]
           : []),
-        ...(result.output
-          ? [
-              {
-                type: "text" as const,
-                text: result.output,
-              },
-            ]
-          : []),
+        {
+          type: "text" as const,
+          text: output,
+        },
       ],
       finishReason: finishReason(result.status),
       usage: usage(result.usage),
@@ -162,12 +160,15 @@ class CodexDelegateLanguageModel implements LanguageModelV3 {
           });
           void run
             .then((result) => {
-              if (!textStarted && result.output) {
+              requireCompletedTurn(result);
+              const output = result.output ||
+                "Codex completed without text output.";
+              if (!textStarted && output) {
                 enqueue({ type: "text-start", id: textID });
                 enqueue({
                   type: "text-delta",
                   id: textID,
-                  delta: result.output,
+                  delta: output,
                 });
                 textStarted = true;
               }
@@ -321,6 +322,16 @@ function emptyUsage(): LanguageModelV3Usage {
     cachedInputTokens: null,
     reasoningTokens: null,
   });
+}
+
+function requireCompletedTurn(result: {
+  status: string;
+  error?: { message?: string } | null;
+}) {
+  if (result.status === "completed") return;
+  throw new Error(
+    result.error?.message?.trim() || `Codex delegate ${result.status}.`,
+  );
 }
 
 function finishReason(status: string): LanguageModelV3FinishReason {

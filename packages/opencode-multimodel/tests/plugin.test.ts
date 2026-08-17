@@ -95,7 +95,9 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
     "MUST NOT be empty",
   );
   expect(config.command?.collab?.model).toBe("test/tool-model");
-  expect(config.command?.workflow?.model).toBe("test/tool-model");
+  expect(config.command?.workflow?.model).toBeUndefined();
+  expect(config.command?.workflow?.template).toContain("omit name");
+  expect(config.command?.workflow?.template).toContain("dynamic workflow");
   expect(config.command?.fleet?.model).toBe("test/tool-model");
   expect(config.command?.mode).toBeUndefined();
   expect(config.command?.runs).toBeUndefined();
@@ -165,6 +167,67 @@ test("server plugin registers fleet, collaboration and workflow surfaces", async
     },
   ]);
   expect(asked).toEqual(["multimodel.fleet", "multimodel.collab"]);
+
+  const prompted: Array<{ body?: { model?: { providerID: string; modelID: string } } }> = [];
+  const dynamicPlugin = await serverModule.server(
+    {
+      directory,
+      client: {
+        session: {
+          async create() {
+            return { data: { id: "child" } };
+          },
+          async prompt(input: { body?: { model?: { providerID: string; modelID: string } } }) {
+            prompted.push(input);
+            return { data: { parts: [{ type: "text", text: "phase done" }] } };
+          },
+          async abort() {
+            return { data: true };
+          },
+          async get() {
+            return {
+              data: {
+                id: "parent",
+                agent: "build",
+                model: { providerID: "xai", id: "grok-4.6" },
+              },
+            };
+          },
+        },
+        provider: {
+          async list() {
+            return { data: { all: [] } };
+          },
+        },
+      },
+    } as never,
+    { statePath: `${directory}/dynamic-state.json`, fleet },
+  );
+  const dynamic = await dynamicPlugin.tool?.multimodel_workflow?.execute(
+    { action: "run", input: "audit the routes" },
+    {
+      sessionID: "parent",
+      agent: "build",
+      abort: new AbortController().signal,
+      async ask() {},
+      metadata() {},
+    } as never,
+  );
+  expect(dynamic).toMatchObject({
+    title: "dynamic: completed",
+    metadata: { status: "completed" },
+  });
+  expect(prompted.map((item) =>
+    `${item.body?.model?.providerID}/${item.body?.model?.modelID}`
+  )).toEqual([
+    "xai/grok-4.6",
+    "xai/grok-4.6",
+    "test/model",
+    "xai/grok-4.6",
+    "xai/grok-4.6",
+  ]);
+  await dynamicPlugin.dispose?.();
+
   await plugin.dispose?.();
   server.stop(true);
 });
@@ -289,6 +352,7 @@ test("TUI plugin registers slash commands and dedicated routes", async () => {
   ]);
   expect(slash).toEqual([
     "fleet",
+    "workflow-fleet",
     "lead",
     "collab",
     "workflow",

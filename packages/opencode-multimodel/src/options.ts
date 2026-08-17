@@ -116,7 +116,7 @@ function parseWorkflows(value: unknown): MultiModelOptions["workflows"] {
     timeoutMs: optionalInteger(
       input.timeoutMs,
       "workflows.timeoutMs",
-      300_000,
+      900_000,
       100,
       3_600_000,
     ),

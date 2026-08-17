@@ -1,4 +1,5 @@
 import { mapLimit } from "./concurrency.ts";
+import { suggestMemberForStep } from "./dynamic.ts";
 import { collaborationSystem } from "./prompts.ts";
 import type {
   AgentRunner,
@@ -257,40 +258,123 @@ async function executeStep(
     state.status = "running";
     state.startedAt = Date.now();
   });
-  const member = workflowMember(fleet, lead, step);
-  try {
-    const response = await runner.run({
-      parentSessionID,
-      member,
-      prompt: interpolate(step.prompt, inputValues(run)),
-      system: [
-        collaborationSystem(
-          member,
-          lead,
-          fleet.members.filter((item) => item.enabled),
-        ),
-        `You are executing declarative workflow **${definition.name}**, step **${step.id}**. Return only this step's concrete result.`,
-      ].join("\n\n"),
-      signal: options.signal,
-      runID: run.id,
-      stepID: step.id,
-      callIndex: definition.steps.findIndex((item) => item.id === step.id),
-    });
-    await update(run, options, () => {
-      state.status = "completed";
-      state.memberID = member.id;
-      state.output = response.text;
-      state.error = undefined;
-      state.completedAt = Date.now();
-    });
-  } catch (error) {
-    await update(run, options, () => {
-      state.status = options.signal?.aborted ? "cancelled" : "failed";
-      state.memberID = member.id;
-      state.error = error instanceof Error ? error.message : String(error);
-      state.completedAt = Date.now();
-    });
+  const tried: string[] = [];
+  const failures: string[] = [];
+  let lastError: unknown;
+  const stepIndex = definition.steps.findIndex((item) => item.id === step.id);
+  while (true) {
+    const member = nextWorkflowMember(fleet, lead, step, tried);
+    if (!member) {
+      await update(run, options, () => {
+        state.status = options.signal?.aborted ? "cancelled" : "failed";
+        state.memberID = tried.at(-1) ?? step.memberID ?? lead.id;
+        state.error = describeStepFailures(failures, lastError);
+        state.completedAt = Date.now();
+      });
+      return;
+    }
+    tried.push(member.id);
+    const seat = seatSignal(
+      options.signal,
+      options.seatTimeoutMs ?? 180_000,
+      `Fleet member ${member.id} timed out.`,
+    );
+    try {
+      const response = await runner.run({
+        parentSessionID,
+        member,
+        prompt: interpolate(step.prompt, inputValues(run)),
+        system: [
+          collaborationSystem(
+            member,
+            lead,
+            fleet.members.filter((item) => item.enabled),
+          ),
+          `You are executing declarative workflow **${definition.name}**, step **${step.id}**. Return only this step's concrete result.`,
+        ].join("\n\n"),
+        signal: seat.signal,
+        runID: run.id,
+        stepID: step.id,
+        callIndex: stepIndex * 100 + (tried.length - 1),
+      });
+      await update(run, options, () => {
+        state.status = "completed";
+        state.memberID = member.id;
+        state.output = failures.length
+          ? `Fell back to ${member.id} after ${failures.join("; ")}\n\n${response.text}`
+          : response.text;
+        state.error = undefined;
+        state.completedAt = Date.now();
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      failures.push(
+        `${member.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      if (options.signal?.aborted) {
+        await update(run, options, () => {
+          state.status = "cancelled";
+          state.memberID = member.id;
+          state.error = describeStepFailures(failures, error);
+          state.completedAt = Date.now();
+        });
+        return;
+      }
+    } finally {
+      seat.dispose();
+    }
   }
+}
+
+function seatSignal(
+  parent: AbortSignal | undefined,
+  timeoutMs: number,
+  reason: string,
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(reason), timeoutMs);
+  const onParent = () => {
+    clearTimeout(timer);
+    controller.abort(parent?.reason);
+  };
+  parent?.addEventListener("abort", onParent, { once: true });
+  if (parent?.aborted) onParent();
+  return {
+    signal: controller.signal,
+    dispose() {
+      clearTimeout(timer);
+      parent?.removeEventListener("abort", onParent);
+    },
+  };
+}
+
+function nextWorkflowMember(
+  fleet: Fleet,
+  lead: FleetMember,
+  step: WorkflowStep,
+  tried: string[],
+) {
+  if (tried.length === 0) {
+    if (!step.memberID) return workflowMember(fleet, lead, step);
+    const assigned = fleet.members.find((member) =>
+      member.id === step.memberID && member.enabled
+    );
+    if (assigned) return workflowMember(fleet, lead, step);
+  }
+  const exclude = [
+    ...tried,
+    ...(step.memberID && tried.length === 0 ? [step.memberID] : []),
+  ];
+  const pick = suggestMemberForStep(step, fleet, tried, exclude);
+  return pick
+    ? workflowMember(fleet, lead, { ...step, memberID: pick.id })
+    : undefined;
+}
+
+function describeStepFailures(failures: string[], lastError: unknown) {
+  if (failures.length > 0) return failures.join(" | ");
+  return lastError instanceof Error ? lastError.message : String(lastError);
 }
 
 function workflowMember(fleet: Fleet, lead: FleetMember, step: WorkflowStep) {

@@ -17,10 +17,15 @@ import {
   Show,
 } from "solid-js";
 import {
+  defaultDynamicWorkflow,
+  DYNAMIC_WORKFLOW_NAME,
+} from "./dynamic.ts";
+import {
   asOpenCodeClient,
   discoverFleet,
   listAvailableFleetModels,
   OpenCodeAgentRunner,
+  resolveSessionSelection,
 } from "./opencode.ts";
 import { RunService } from "./orchestration.ts";
 import { parseOptions, type MultiModelOptions } from "./options.ts";
@@ -32,6 +37,17 @@ import {
   type ComposerMode,
   type WorkflowDefinition,
 } from "./types.ts";
+import {
+  adjacentBoardRun,
+  boardOverview,
+  chunkTasks,
+  firstBoardAgent,
+  nextBoardAgent,
+  previousBoardAgent,
+  resolveWorkflowBoard,
+  type AgentCallSnapshot,
+  type WorkflowBoardRun,
+} from "./workflow-board.ts";
 import { loadWorkflowDirectories } from "./workflow-files.ts";
 
 const ROUTE_FLEET = "multimodel.fleet";
@@ -133,11 +149,24 @@ const tui: TuiPlugin = async (api, rawOptions) => {
     commands: [
       {
         name: "multimodel.fleet",
-        title: "Multi-model fleet",
-        description: "Select participants and add, remove, or lead models",
+        title: "Workflow fleet",
+        description:
+          "Add models that workflows pick from; choose the lead, or toggle seats",
         category: "Multi-model",
         namespace: "palette",
         slashName: "fleet",
+        run() {
+          void manageFleet(api, store, client);
+        },
+      },
+      {
+        name: "multimodel.workflow-fleet",
+        title: "Workflow fleet",
+        description:
+          "Same as /fleet: the model seats a workflow assigns to its tasks",
+        category: "Multi-model",
+        namespace: "palette",
+        slashName: "workflow-fleet",
         run() {
           void manageFleet(api, store, client);
         },
@@ -238,7 +267,7 @@ function FleetScreen(props: ScreenProps) {
   const [state] = createResource(() => props.store.read());
   useBackKey(props.api, props.params);
   return (
-    <Screen api={props.api} title="Multi-model fleet" params={props.params}>
+    <Screen api={props.api} title="Workflow fleet" params={props.params}>
       <Show
         when={state()}
         fallback={
@@ -295,66 +324,98 @@ function FleetScreen(props: ScreenProps) {
 }
 
 function WorkflowsScreen(props: ScreenProps) {
-  const [state] = createResource(() => props.store.read());
+  const state = usePollingState(props.store);
+  const initial = typeof props.params?.runID === "string"
+    ? props.params.runID
+    : undefined;
+  const [selectedRunID, setSelectedRunID] = createSignal(initial);
+  const [selectedAgentKey, setSelectedAgentKey] = createSignal<string>();
+  const [calls, setCalls] = createSignal<AgentCallSnapshot[]>([]);
+  createEffect(() => {
+    const snapshot = state();
+    const resolved = snapshot
+      ? resolveWorkflowBoard({
+        runs: snapshot.runs,
+        fleet: snapshot.fleet,
+        selectedRunID: selectedRunID(),
+      })
+      : undefined;
+    const runID = resolved?.selected?.id;
+    if (runID && runID !== selectedRunID()) setSelectedRunID(runID);
+    if (!runID) {
+      setCalls([]);
+      return;
+    }
+    void props.store.listAgentCalls(runID).then((next) => {
+      if (selectedRunID() === runID) setCalls(next);
+    });
+  });
+  const board = () => {
+    const snapshot = state();
+    if (!snapshot) {
+      return {
+        boards: [] as WorkflowBoardRun[],
+        selected: undefined,
+        selectedAgent: undefined,
+      };
+    }
+    return resolveWorkflowBoard({
+      runs: snapshot.runs,
+      fleet: snapshot.fleet,
+      calls: { [selectedRunID() ?? ""]: calls() },
+      selectedRunID: selectedRunID(),
+      selectedAgentKey: selectedAgentKey(),
+    });
+  };
+  useWorkflowBoardKeys(props.api, {
+    nextRun() {
+      const next = adjacentBoardRun(board().boards, board().selected?.id, 1);
+      if (!next) return;
+      setCalls([]);
+      setSelectedRunID(next.id);
+      setSelectedAgentKey(firstBoardAgent(next)?.key);
+    },
+    prevRun() {
+      const next = adjacentBoardRun(board().boards, board().selected?.id, -1);
+      if (!next) return;
+      setCalls([]);
+      setSelectedRunID(next.id);
+      setSelectedAgentKey(firstBoardAgent(next)?.key);
+    },
+    nextAgent() {
+      const run = board().selected;
+      if (!run) return;
+      setSelectedAgentKey(nextBoardAgent(run, board().selectedAgent?.key)?.key);
+    },
+    prevAgent() {
+      const run = board().selected;
+      if (!run) return;
+      setSelectedAgentKey(
+        previousBoardAgent(run, board().selectedAgent?.key)?.key,
+      );
+    },
+  });
   useBackKey(props.api, props.params);
   return (
-    <Screen api={props.api} title="Multi-model workflows" params={props.params}>
+    <Screen api={props.api} title="Workflows" params={props.params}>
       <Show
         when={state()}
         fallback={
           <text fg={props.api.theme.current.textMuted}>Loading workflows…</text>
         }
       >
-        {(value) => (
-          <box flexDirection="column" gap={1}>
-            <text fg={props.api.theme.current.accent}>Definitions</text>
-            <Show
-              when={value().workflows.length > 0}
-              fallback={
-                <text fg={props.api.theme.current.textMuted}>
-                  No workflows saved.
-                </text>
-              }
-            >
-              <For each={value().workflows}>
-                {(workflow) => (
-                  <text fg={props.api.theme.current.text}>
-                    {workflow.name} · {workflowSummary(workflow)} ·{" "}
-                    {workflow.description ?? "No description"}
-                  </text>
-                )}
-              </For>
-            </Show>
-            <text fg={props.api.theme.current.accent}>Recent runs</text>
-            <Show
-              when={value().runs.length > 0}
-              fallback={
-                <text fg={props.api.theme.current.textMuted}>No runs yet.</text>
-              }
-            >
-              <For each={value().runs.slice(0, 20)}>
-                {(run) => (
-                  <text
-                    fg={
-                      run.status === "completed"
-                        ? props.api.theme.current.success
-                        : run.status === "failed"
-                          ? props.api.theme.current.error
-                          : props.api.theme.current.warning
-                    }
-                  >
-                    {run.definition} · {run.status} ·{" "}
-                    {
-                      run.steps.filter((step) => step.status === "completed")
-                        .length
-                    }
-                    /{run.steps.length} steps
-                  </text>
-                )}
-              </For>
-            </Show>
-          </box>
-        )}
+        <WorkflowBoardView
+          api={props.api}
+          runs={board().boards}
+          selectedRunID={board().selected?.id}
+          selectedAgentKey={board().selectedAgent?.key}
+          onSelectRun={(run) => {
+            setCalls([]);
+            setSelectedRunID(run.id);
+            setSelectedAgentKey(firstBoardAgent(run)?.key);
+          }}
+          onSelectAgent={setSelectedAgentKey}
+        />
       </Show>
     </Screen>
   );
@@ -430,72 +491,327 @@ function CollabScreen(
 }
 
 function WorkflowScreen(props: ScreenProps & { runs: RunService }) {
-  const controller = new AbortController();
-  const [snapshot, setSnapshot] = createSignal<string>("Starting…");
-  const [output] = createResource(async () => {
-    const state = await props.store.read();
-    const name = stringParam(props.params?.name, "name");
-    const definition = state.workflows.find(
-      (workflow) => workflow.name === name,
-    );
-    if (!definition) throw new Error(`Workflow ${name} does not exist.`);
-    if (definition.kind === "script") {
+  const [runID, setRunID] = createSignal<string>();
+  const [selectedAgentKey, setSelectedAgentKey] = createSignal<string>();
+  const [calls, setCalls] = createSignal<AgentCallSnapshot[]>([]);
+  const state = usePollingState(props.store);
+  const [started] = createResource(async () => {
+    const snapshot = await props.store.read();
+    const requested = stringParam(props.params?.name, "name");
+    const input = typeof props.params?.input === "string"
+      ? props.params.input
+      : "";
+    const definition = requested === DYNAMIC_WORKFLOW_NAME
+      ? defaultDynamicWorkflow(input)
+      : snapshot.workflows.find((workflow) => workflow.name === requested);
+    if (!definition) throw new Error(`Workflow ${requested} does not exist.`);
+    if (definition.kind === "script" || definition.kind === "module") {
       throw new Error(
-        "Run script workflows through /workflow so OpenCode can request source-hash permission.",
+        "Run script and TypeScript workflows through /workflow so OpenCode can request source-hash permission.",
       );
     }
-    return props.runs.startWorkflow({
-      sessionID: stringParam(props.params?.sessionID, "sessionID"),
+    const sessionID = stringParam(props.params?.sessionID, "sessionID");
+    const session = await resolveSessionSelection(
+      asOpenCodeClient(props.api.client),
+      sessionID,
+    );
+    const admitted = await props.runs.startWorkflow({
+      sessionID,
       definition,
-      input: typeof props.params?.input === "string" ? props.params.input : "",
-      signal: controller.signal,
-    }).then((run) => {
-      setSnapshot(
-        `${run.status} · ${run.steps.filter((step) => step.status === "completed").length}/${run.steps.length} steps`,
-      );
-      return run;
+      input,
+      background: true,
+      sessionModel: session.model,
+      sessionAgent: session.agent,
     });
+    setRunID(admitted.id);
+    return admitted;
   });
-  onCleanup(() => controller.abort());
-  useBackKey(props.api, props.params);
+  createEffect(() => {
+    const snapshot = state();
+    const id = runID();
+    if (!snapshot || !id) return;
+    void props.store.listAgentCalls(id).then(setCalls);
+  });
+  const boards = () => {
+    const snapshot = state();
+    const id = runID();
+    if (!snapshot || !id) return [];
+    return resolveWorkflowBoard({
+      runs: snapshot.runs.filter((run) => run.id === id),
+      fleet: snapshot.fleet,
+      calls: { [id]: calls() },
+      selectedRunID: id,
+      selectedAgentKey: selectedAgentKey(),
+    }).boards;
+  };
+  const selected = () => boards()[0];
+  useWorkflowBoardKeys(props.api, {
+    nextRun() {},
+    prevRun() {},
+    nextAgent() {
+      const run = selected();
+      if (!run) return;
+      setSelectedAgentKey(
+        nextBoardAgent(run, selectedAgentKey() ?? firstBoardAgent(run)?.key)?.key,
+      );
+    },
+    prevAgent() {
+      const run = selected();
+      if (!run) return;
+      setSelectedAgentKey(
+        previousBoardAgent(run, selectedAgentKey() ?? firstBoardAgent(run)?.key)
+          ?.key,
+      );
+    },
+  });
+  useBackKey(props.api, {
+    ...props.params,
+    returnRoute: props.params?.returnRoute ?? {
+      name: ROUTE_WORKFLOWS,
+      params: { runID: runID() },
+    },
+  });
   return (
     <Screen
       api={props.api}
       title={`Workflow · ${String(props.params?.name ?? "")}`}
       params={props.params}
     >
-      <box flexDirection="column" gap={1}>
-        <text fg={props.api.theme.current.info}>{snapshot()}</text>
-        <Show when={output.error}>
-          <text fg={props.api.theme.current.error}>{String(output.error)}</text>
-        </Show>
-        <Show when={output()}>
-          {(run) => (
-            <box flexDirection="column" gap={1}>
-              <For each={run().steps}>
-                {(step) => (
-                  <text
-                    fg={
-                      step.status === "completed"
-                        ? props.api.theme.current.success
-                        : step.status === "failed"
-                          ? props.api.theme.current.error
-                          : props.api.theme.current.textMuted
-                    }
-                  >
-                    {step.id} · {step.memberID} · {step.status}
-                  </text>
-                )}
-              </For>
-              <text fg={props.api.theme.current.text} wrapMode="word">
-                {run().final ?? run().error ?? "No final output."}
-              </text>
-            </box>
-          )}
-        </Show>
-      </box>
+      <Show when={started.error}>
+        <text fg={props.api.theme.current.error}>{String(started.error)}</text>
+      </Show>
+      <Show
+        when={selected()}
+        fallback={
+          <text fg={props.api.theme.current.textMuted}>
+            Starting workflow board…
+          </text>
+        }
+      >
+        <WorkflowBoardView
+          api={props.api}
+          runs={boards()}
+          selectedRunID={selected()?.id}
+          selectedAgentKey={selectedAgentKey() ?? firstBoardAgent(selected())?.key}
+          onSelectRun={() => undefined}
+          onSelectAgent={setSelectedAgentKey}
+        />
+      </Show>
     </Screen>
   );
+}
+
+function WorkflowBoardView(props: {
+  api: TuiPluginApi;
+  runs: WorkflowBoardRun[];
+  selectedRunID?: string;
+  selectedAgentKey?: string;
+  onSelectRun: (run: WorkflowBoardRun) => void;
+  onSelectAgent: (key: string) => void;
+}) {
+  const selected = () =>
+    props.runs.find((run) => run.id === props.selectedRunID) ?? props.runs[0];
+  const selectedAgent = () => {
+    const run = selected();
+    if (!run) return undefined;
+    return run.tasks.flatMap((task) => task.agents).find((agent) =>
+      agent.key === props.selectedAgentKey
+    );
+  };
+  const theme = () => props.api.theme.current;
+  return (
+    <box flexDirection="row" flexGrow={1} minHeight={0} gap={1}>
+      <box
+        width={26}
+        flexDirection="column"
+        gap={1}
+        border
+        borderStyle="single"
+        borderColor={theme().textMuted}
+        padding={1}
+      >
+        <text fg={theme().accent}>ACTIVE</text>
+        <Show
+          when={props.runs.length > 0}
+          fallback={
+            <text fg={theme().textMuted}>
+              No workflow runs. /workflow [task] starts one.
+            </text>
+          }
+        >
+          <For each={props.runs}>
+            {(run) => (
+              <box
+                flexDirection="column"
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={run.id === selected()?.id
+                  ? theme().backgroundElement
+                  : undefined}
+                onMouseUp={() => props.onSelectRun(run)}
+              >
+                <text fg={runColor(props.api, run.status)}>
+                  {run.active ? "●" : "○"} {run.name}
+                </text>
+                <text fg={theme().textMuted}>
+                  {run.status} · lead {run.leadID}
+                </text>
+              </box>
+            )}
+          </For>
+        </Show>
+      </box>
+      <box flexGrow={1} minWidth={0} flexDirection="column" gap={1}>
+        <text fg={theme().accent}>
+          TASKS
+          {selected()
+            ? ` · ${selected()!.name} · lead ${selected()!.leadID}`
+            : ""}
+        </text>
+        <Show
+          when={selected()}
+          fallback={
+            <text fg={theme().textMuted}>Select a workflow on the left.</text>
+          }
+        >
+          <For each={chunkTasks(selected()!.tasks)}>
+            {(row) => (
+              <box flexDirection="row" gap={1} flexGrow={1} minHeight={8}>
+                <For each={row}>
+                  {(task) => (
+                    <box
+                      flexGrow={1}
+                      minWidth={0}
+                      flexDirection="column"
+                      gap={1}
+                      border
+                      borderStyle="rounded"
+                      borderColor={task.agents.some((agent) =>
+                          agent.key === props.selectedAgentKey
+                        )
+                        ? theme().accent
+                        : theme().textMuted}
+                      padding={1}
+                    >
+                      <text fg={runColor(props.api, task.status)}>
+                        {task.title} · {task.status}
+                      </text>
+                      <For each={task.agents}>
+                        {(agent) => (
+                          <box
+                            flexDirection="column"
+                            paddingLeft={1}
+                            paddingRight={1}
+                            backgroundColor={agent.key === props.selectedAgentKey
+                              ? theme().backgroundElement
+                              : undefined}
+                            onMouseUp={() => props.onSelectAgent(agent.key)}
+                          >
+                            <text
+                              fg={agent.role === "lead"
+                                ? theme().accent
+                                : theme().info}
+                            >
+                              {agent.role === "lead" ? "LEAD" : "WORK"}{" "}
+                              {agent.memberID}
+                            </text>
+                            <text fg={runColor(props.api, agent.status)}>
+                              {agent.status} · {agent.doing}
+                            </text>
+                          </box>
+                        )}
+                      </For>
+                    </box>
+                  )}
+                </For>
+              </box>
+            )}
+          </For>
+        </Show>
+      </box>
+      <box
+        width={36}
+        flexDirection="column"
+        gap={1}
+        border
+        borderStyle="single"
+        borderColor={theme().textMuted}
+        padding={1}
+      >
+        <text fg={theme().accent}>
+          {selectedAgent() ? "EXECUTING" : "OVERVIEW"}
+        </text>
+        <text fg={theme().text} wrapMode="word">
+          {selected()
+            ? boardOverview(selected()!, selectedAgent())
+            : "Workflow reports land here. Click an agent tile to inspect the prompt and result."}
+        </text>
+      </box>
+    </box>
+  );
+}
+
+function useWorkflowBoardKeys(
+  api: TuiPluginApi,
+  actions: {
+    nextRun: () => void;
+    prevRun: () => void;
+    nextAgent: () => void;
+    prevAgent: () => void;
+  },
+) {
+  onMount(() => {
+    const unregister = api.keymap.registerLayer({
+      priority: 110,
+      commands: [
+        {
+          name: "multimodel.workflows.next",
+          title: "Next workflow",
+          run: () => {
+            actions.nextRun();
+            return true;
+          },
+        },
+        {
+          name: "multimodel.workflows.prev",
+          title: "Previous workflow",
+          run: () => {
+            actions.prevRun();
+            return true;
+          },
+        },
+        {
+          name: "multimodel.workflows.next-agent",
+          title: "Next agent tile",
+          run: () => {
+            actions.nextAgent();
+            return true;
+          },
+        },
+        {
+          name: "multimodel.workflows.prev-agent",
+          title: "Previous agent tile",
+          run: () => {
+            actions.prevAgent();
+            return true;
+          },
+        },
+      ],
+      bindings: [
+        { key: "down", cmd: "multimodel.workflows.next", desc: "Next run" },
+        { key: "j", cmd: "multimodel.workflows.next", desc: "Next run" },
+        { key: "up", cmd: "multimodel.workflows.prev", desc: "Previous run" },
+        { key: "k", cmd: "multimodel.workflows.prev", desc: "Previous run" },
+        { key: "tab", cmd: "multimodel.workflows.next-agent", desc: "Next agent" },
+        {
+          key: "shift+tab",
+          cmd: "multimodel.workflows.prev-agent",
+          desc: "Previous agent",
+        },
+      ],
+    });
+    onCleanup(unregister);
+  });
 }
 
 function RunLedgerScreen(props: ScreenProps) {
@@ -951,29 +1267,42 @@ async function chooseComposerMode(
         {
           title: "WORKFLOW",
           value: "workflow" as const,
-          description: "Rewrite normal prompts to a selected /workflow",
+          description:
+            "Start a dynamic workflow, or rewrite prompts to a saved /workflow",
           async onSelect() {
             const workflows = (await store.read()).workflows;
-            if (workflows.length === 0) {
-              toast(api, "No workflows saved.", "warning");
-              return;
-            }
             api.ui.dialog.replace(() => (
               <DialogSelect
                 title="Workflow"
-                options={workflows.map((workflow) => ({
-                  title: workflow.name,
-                  value: workflow.name,
-                  description: workflowSummary(workflow),
-                  onSelect() {
-                    void saveComposerSelection(store, controller, {
-                      mode: "workflow",
-                      collaborationMode: options.defaultMode,
-                      workflowName: workflow.name,
-                    });
-                    api.ui.dialog.clear();
+                options={[
+                  {
+                    title: "dynamic",
+                    value: DYNAMIC_WORKFLOW_NAME,
+                    description:
+                      "Write and run understand → change → verify on the current session model",
+                    onSelect() {
+                      void saveComposerSelection(store, controller, {
+                        mode: "workflow",
+                        collaborationMode: options.defaultMode,
+                        workflowName: DYNAMIC_WORKFLOW_NAME,
+                      });
+                      api.ui.dialog.clear();
+                    },
                   },
-                }))}
+                  ...workflows.map((workflow) => ({
+                    title: workflow.name,
+                    value: workflow.name,
+                    description: workflowSummary(workflow),
+                    onSelect() {
+                      void saveComposerSelection(store, controller, {
+                        mode: "workflow",
+                        collaborationMode: options.defaultMode,
+                        workflowName: workflow.name,
+                      });
+                      api.ui.dialog.clear();
+                    },
+                  })),
+                ]}
               />
             ));
           },
@@ -1022,7 +1351,9 @@ export function routeComposerPrompt(
     };
   }
   const workflowName = automatic?.workflowName ?? selection.workflowName;
-  if (!workflowName) return prompt;
+  if (!workflowName || workflowName === DYNAMIC_WORKFLOW_NAME) {
+    return { ...prompt, input: `/workflow ${prompt.input}` };
+  }
   return { ...prompt, input: `/workflow ${workflowName} ${prompt.input}` };
 }
 
@@ -1150,9 +1481,9 @@ function runColor(api: TuiPluginApi, status: string) {
 }
 
 function workflowSummary(workflow: WorkflowDefinition) {
-  return workflow.kind === "script"
-    ? "confined script"
-    : `${workflow.steps.length} DAG steps`;
+  if (workflow.kind === "script") return "confined script";
+  if (workflow.kind === "module") return "TypeScript workflow";
+  return `${workflow.steps.length} DAG steps`;
 }
 
 function escapeRegExp(value: string) {
@@ -1228,7 +1559,7 @@ async function manageFleet(
   const enabled = state.fleet.members.filter((member) => member.enabled).length;
   api.ui.dialog.replace(() => (
     <DialogSelect
-      title={`Multi-model fleet · ${enabled} active · lead ${state.fleet.leadID}`}
+      title={`Workflow fleet · ${enabled} seats · lead ${state.fleet.leadID}`}
       skipFilter
       options={[
         ...state.fleet.members.map((member) => ({
@@ -1344,7 +1675,6 @@ async function addFleetModel(
     id,
     role: "specialist",
     model: { providerID: model.providerID, modelID: model.modelID },
-    agent: "plan",
     enabled: true,
     isolation: "shared",
   });
@@ -1484,52 +1814,74 @@ async function selectWorkflow(
   composer: ComposerController,
 ) {
   const state = await store.read();
-  if (state.workflows.length === 0)
-    return toast(api, "No workflows saved.", "warning");
   const returnRoute = api.route.current;
   const DialogSelect = api.ui.DialogSelect;
   api.ui.dialog.replace(() => (
     <DialogSelect
       title="Run workflow"
-      options={state.workflows.map((definition) => ({
-        title: definition.name,
-        value: definition.name,
-        description: `${workflowSummary(definition)} · ${definition.description ?? "No description"}`,
-        onSelect() {
-          if (definition.kind === "script") {
-            const prompt = composer.ref(api.route.current);
-            if (!prompt) {
-              toast(
-                api,
-                `Use /workflow ${definition.name} from the native composer to approve this script.`,
-                "warning",
-              );
+      options={[
+        {
+          title: "dynamic",
+          value: DYNAMIC_WORKFLOW_NAME,
+          description:
+            "Understand, change, and verify this task on the current session model",
+          onSelect() {
+            askForInput(
+              api,
+              "Dynamic workflow task",
+              "What should the workflow do?",
+              async (input) => {
+                const sessionID = await parentSession(api);
+                api.route.navigate(ROUTE_WORKFLOW, {
+                  name: DYNAMIC_WORKFLOW_NAME,
+                  input,
+                  sessionID,
+                  returnRoute,
+                });
+              },
+            );
+          },
+        },
+        ...state.workflows.map((definition) => ({
+          title: definition.name,
+          value: definition.name,
+          description: `${workflowSummary(definition)} · ${definition.description ?? "No description"}`,
+          onSelect() {
+            if (definition.kind === "script" || definition.kind === "module") {
+              const prompt = composer.ref(api.route.current);
+              if (!prompt) {
+                toast(
+                  api,
+                  `Use /workflow ${definition.name} from the native composer to approve this script.`,
+                  "warning",
+                );
+                return;
+              }
+              prompt.set({
+                ...prompt.current,
+                input: `/workflow ${definition.name} `,
+              });
+              prompt.focus();
+              api.ui.dialog.clear();
               return;
             }
-            prompt.set({
-              ...prompt.current,
-              input: `/workflow ${definition.name} `,
-            });
-            prompt.focus();
-            api.ui.dialog.clear();
-            return;
-          }
-          askForInput(
-            api,
-            `${definition.name} input`,
-            "Workflow input",
-            async (input) => {
-              const sessionID = await parentSession(api);
-              api.route.navigate(ROUTE_WORKFLOW, {
-                name: definition.name,
-                input,
-                sessionID,
-                returnRoute,
-              });
-            },
-          );
-        },
-      }))}
+            askForInput(
+              api,
+              `${definition.name} input`,
+              "Workflow input",
+              async (input) => {
+                const sessionID = await parentSession(api);
+                api.route.navigate(ROUTE_WORKFLOW, {
+                  name: definition.name,
+                  input,
+                  sessionID,
+                  returnRoute,
+                });
+              },
+            );
+          },
+        })),
+      ]}
     />
   ));
 }

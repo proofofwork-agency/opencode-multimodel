@@ -648,6 +648,48 @@ describe("OpenCode Codex delegate plugin", () => {
     await hooks.dispose!();
     expect(delegate.closeAllCalls).toBe(1);
   });
+
+  test("throws Codex usage-limit failures instead of returning empty text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-delegate-limit-"));
+    const delegate = new FakeDelegate();
+    delegate.turnResult = {
+      ...result("failed"),
+      error: {
+        code: "TURN_FAILED",
+        message:
+          "You've hit your usage limit. Try again at Aug 20th, 2026 5:28 AM.",
+        retryable: false,
+      },
+    };
+    const runtime = new CodexProviderRuntime({
+      directory: root,
+      defaults: {
+        mode: "write",
+        isolation: "worktree",
+        approvalPolicy: "ask",
+        timeoutMs: 1000,
+        confirmedUnsafe: false,
+      },
+      delegate,
+    });
+    const model = createCodexDelegateProvider({
+      name: "codex-delegate",
+      runtime,
+    }).languageModel("gpt-5.6-terra");
+    const call = {
+      prompt: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "Implement the parser." }],
+        },
+      ],
+    } satisfies LanguageModelV3CallOptions;
+    await expect(model.doGenerate(call)).rejects.toThrow("usage limit");
+    const streamed = await model.doStream(call);
+    const parts = [];
+    for await (const part of streamed.stream) parts.push(part);
+    expect(parts.some((part) => part.type === "error")).toBe(true);
+  });
 });
 
 function pluginInput(directory: string) {

@@ -181,8 +181,10 @@ export class StateStore {
 
   async saveWorkflow(definition: WorkflowDefinition) {
     await this.ready;
-    const source = definition.kind === "script" ? definition.source : null;
-    const sourceHash = definition.kind === "script"
+    const source = definition.kind === "script" || definition.kind === "module"
+      ? definition.source
+      : null;
+    const sourceHash = definition.kind === "script" || definition.kind === "module"
       ? definition.sourceHash ?? workflowSourceHash(definition.source)
       : null;
     this.transaction(() => {
@@ -201,9 +203,11 @@ export class StateStore {
         definition.name,
         definition.kind ?? "dag",
         definition.description ?? null,
-        JSON.stringify(definition.kind === "script"
-          ? { ...definition, sourceHash }
-          : { ...definition, kind: "dag" }),
+        JSON.stringify(
+          definition.kind === "script" || definition.kind === "module"
+            ? { ...definition, sourceHash }
+            : { ...definition, kind: "dag" },
+        ),
         source,
         sourceHash,
         Date.now(),
@@ -422,6 +426,36 @@ export class StateStore {
         error: input.error,
       });
     });
+  }
+
+  async listAgentCalls(runID: string) {
+    await this.ready;
+    return this.database
+      .query<{
+        step_id: string | null;
+        call_index: number;
+        member_id: string;
+        prompt: string;
+        options_json: string;
+        child_session_id: string | null;
+        output: string | null;
+        error: string | null;
+        status: string;
+      }, [string]>(
+        `SELECT step_id, call_index, member_id, prompt, options_json,
+          child_session_id, output, error, status
+         FROM agent_calls WHERE run_id = ? ORDER BY call_index`,
+      )
+      .all(runID)
+      .map((call) => ({
+        stepID: call.step_id ?? undefined,
+        memberID: call.member_id,
+        prompt: call.prompt,
+        status: call.status,
+        output: call.output ?? undefined,
+        error: call.error ?? undefined,
+        model: modelFromOptions(call.options_json),
+      }));
   }
 
   async cachedAgentCalls(runID: string) {
@@ -768,7 +802,7 @@ export class StateStore {
   }
 
   private saveWorkflowSync(definition: WorkflowDefinition) {
-    const sourceHash = definition.kind === "script"
+    const sourceHash = definition.kind === "script" || definition.kind === "module"
       ? definition.sourceHash ?? workflowSourceHash(definition.source)
       : null;
     this.database.query(
@@ -786,10 +820,14 @@ export class StateStore {
       definition.name,
       definition.kind ?? "dag",
       definition.description ?? null,
-      JSON.stringify(definition.kind === "script"
-        ? { ...definition, sourceHash }
-        : { ...definition, kind: "dag" }),
-      definition.kind === "script" ? definition.source : null,
+      JSON.stringify(
+        definition.kind === "script" || definition.kind === "module"
+          ? { ...definition, sourceHash }
+          : { ...definition, kind: "dag" },
+      ),
+      definition.kind === "script" || definition.kind === "module"
+        ? definition.source
+        : null,
       sourceHash,
       Date.now(),
       Date.now(),
@@ -1178,4 +1216,24 @@ function isLegacyRun(value: unknown): value is Omit<WorkflowRun, "kind" | "workf
     typeof item.definition === "string" &&
     Array.isArray(item.steps)
   );
+}
+
+function modelFromOptions(value: string) {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const model = (parsed as { model?: { providerID?: unknown; modelID?: unknown } })
+      .model;
+    if (
+      typeof model?.providerID === "string" &&
+      typeof model.modelID === "string"
+    ) {
+      return `${model.providerID}/${model.modelID}`;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }

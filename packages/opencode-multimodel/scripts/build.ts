@@ -1,7 +1,12 @@
 import solidPlugin from "@opentui/solid/bun-plugin";
 
 const result = await Bun.build({
-  entrypoints: ["src/server.ts", "src/tui.tsx", "src/index.ts"],
+  entrypoints: [
+    "src/server.ts",
+    "src/tui.tsx",
+    "src/index.ts",
+    "src/workflow-api.ts",
+  ],
   outdir: "dist",
   target: "bun",
   format: "esm",

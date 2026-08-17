@@ -3,5 +3,6 @@ dist/
 coverage/
 *.tgz
 .codex/
+.worktrees/
 **/.contextrelay/
 **/.opencode/*.sqlite*

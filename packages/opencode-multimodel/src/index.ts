@@ -1,5 +1,6 @@
 export * from "./budget.ts";
 export * from "./collaborate.ts";
+export * from "./dynamic.ts";
 export * from "./jury.ts";
 export * from "./opencode.ts";
 export * from "./orchestration.ts";
@@ -8,4 +9,8 @@ export * from "./script.ts";
 export * from "./state.ts";
 export * from "./types.ts";
 export * from "./workflow.ts";
+export { workflow } from "./workflow-api.ts";
+export * from "./workflow-board.ts";
 export * from "./workflow-files.ts";
+export * from "./workflow-meta.ts";
+export { registerWorkflowSpecifier, runModuleWorkflow } from "./workflow-module.ts";

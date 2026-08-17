@@ -26,6 +26,10 @@
     "./core": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./workflow": {
+      "types": "./dist/workflow-api.d.ts",
+      "import": "./dist/workflow-api.js"
     }
   },
   "files": [

@@ -51,4 +51,39 @@ describe("configured workflow directories", () => {
       "scripted",
     ]);
   });
+
+  test("loads TypeScript workflow() modules without enabling confined scripts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "opencode-workflows-"));
+    const workflows = join(directory, ".opencode", "workflows");
+    await mkdir(workflows, { recursive: true });
+    await Bun.write(
+      join(workflows, "release.ts"),
+      `import { workflow } from "opencode-multimodel/workflow"
+export default workflow({
+  name: "release",
+  description: "Ship notes",
+  phases: ["draft"],
+  async run(_args, ctx) { return ctx.agent({ prompt: "draft" }) }
+})
+`,
+    );
+    const store = new StateStore(join(directory, "state.sqlite"));
+    cleanup.push(async () => {
+      await store.close();
+      await rm(directory, { recursive: true, force: true });
+    });
+    await loadWorkflowDirectories(
+      store,
+      directory,
+      parseOptions(undefined).workflows,
+    );
+    expect((await store.read()).workflows).toEqual([
+      expect.objectContaining({
+        kind: "module",
+        name: "release",
+        description: "Ship notes",
+        phases: ["draft"],
+      }),
+    ]);
+  });
 });

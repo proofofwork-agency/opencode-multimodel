@@ -1,4 +1,5 @@
 import { mapLimit } from "./concurrency.ts";
+import { suggestMemberForStep } from "./dynamic.ts";
 import { collaborationSystem } from "./prompts.ts";
 import { workflowSourceHash } from "./state.ts";
 import type {
@@ -117,7 +118,7 @@ export async function runScriptWorkflow(
   run.error = undefined;
   run.sourceHash = validated.sourceHash;
   await publish(run, options);
-  const timeout = AbortSignal.timeout(options.timeoutMs ?? 300_000);
+  const timeout = AbortSignal.timeout(options.timeoutMs ?? 900_000);
   const signal = options.signal
     ? AbortSignal.any([options.signal, timeout])
     : timeout;
@@ -152,7 +153,7 @@ export async function runScriptWorkflow(
     const cancelled = signal.aborted;
     run.status = cancelled ? "cancelled" : "failed";
     run.error = timeout.aborted
-      ? `Workflow exceeded ${options.timeoutMs ?? 300_000} ms.`
+      ? `Workflow exceeded ${options.timeoutMs ?? 900_000} ms.`
       : error instanceof Error ? error.message : String(error);
     run.steps
       .filter((step) => step.status === "running" || step.status === "pending")
@@ -286,9 +287,13 @@ async function runAgent(
   const memberID = typeof options.memberID === "string"
     ? options.memberID
     : typeof options.agentId === "string" ? options.agentId : undefined;
+  const used = context.run.steps
+    .filter((step) => step.status === "completed" || step.status === "running")
+    .map((step) => step.memberID);
   const member = memberID
     ? context.fleet.members.find((item) => item.id === memberID && item.enabled)
-    : context.lead;
+    : suggestMemberForStep({ id: stepID, prompt }, context.fleet, used) ??
+      context.lead;
   if (!member) {
     throw new ScriptWorkflowError(
       `agent() selected missing or disabled fleet member ${memberID}.`,

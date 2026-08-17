@@ -1,6 +1,13 @@
 import { collaborate } from "./collaborate.ts";
+import {
+  applySessionModel,
+  assignFleetToWorkflow,
+  routeWorkflowAssignments,
+  type SessionSelection,
+} from "./dynamic.ts";
 import type { MultiModelOptions } from "./options.ts";
 import { runScriptWorkflow } from "./script.ts";
+import { runModuleWorkflow } from "./workflow-module.ts";
 import { StateStore, workflowSourceHash } from "./state.ts";
 import type {
   AgentRunner,
@@ -9,6 +16,7 @@ import type {
   CollabMode,
   DurableRun,
   Fleet,
+  ModelRef,
   WorkflowDefinition,
   WorkflowRun,
 } from "./types.ts";
@@ -41,6 +49,8 @@ type WorkflowStart = {
   input: string;
   background?: boolean;
   signal?: AbortSignal;
+  sessionModel?: ModelRef;
+  sessionAgent?: string;
 };
 
 export class RunService {
@@ -85,26 +95,33 @@ export class RunService {
 
   async startWorkflow(input: WorkflowStart) {
     const state = await this.store.read();
+    const fleet = this.workflowFleet(state.fleet, {
+      model: input.sessionModel,
+      agent: input.sessionAgent,
+    });
+    const preview = this.preparedDefinition(input.definition, fleet);
     const now = Date.now();
     const pending: WorkflowRun = {
       id: `workflow_${crypto.randomUUID()}`,
       kind: "workflow",
-      workflowKind: input.definition.kind ?? "dag",
-      definition: input.definition.name,
+      workflowKind: preview.kind === "script" || preview.kind === "module"
+        ? preview.kind
+        : "dag",
+      definition: preview.name,
       sessionID: input.sessionID,
       messageID: input.messageID,
       input: input.input,
       status: "pending",
-      steps: isDagWorkflow(input.definition)
-        ? input.definition.steps.map((step) => ({
+      steps: isDagWorkflow(preview)
+        ? preview.steps.map((step) => ({
           id: step.id,
           status: "pending",
-          memberID: step.memberID ?? state.fleet.leadID,
+          memberID: step.memberID ?? fleet.leadID,
         }))
         : [],
       background: input.background,
-      sourceHash: input.definition.kind === "script"
-        ? workflowSourceHash(input.definition.source)
+      sourceHash: preview.kind === "script" || preview.kind === "module"
+        ? workflowSourceHash(preview.source)
         : undefined,
       createdAt: now,
       updatedAt: now,
@@ -113,7 +130,7 @@ export class RunService {
     if (run.id !== pending.id) return this.resultForExisting(run);
     const promise = this.executeWorkflow(
       pending,
-      state.fleet,
+      fleet,
       input.definition,
       input.signal,
     );
@@ -153,7 +170,7 @@ export class RunService {
       throw new Error(`Workflow ${current.definition} no longer exists.`);
     }
     if (
-      definition.kind === "script" &&
+      (definition.kind === "script" || definition.kind === "module") &&
       current.sourceHash !== workflowSourceHash(definition.source)
     ) {
       throw new Error(
@@ -162,7 +179,12 @@ export class RunService {
     }
     await this.claimResumeLease(runID);
     await this.store.setRunControl(runID, "run");
-    const promise = this.executeWorkflow(current, state.fleet, definition);
+    const fleet = this.workflowFleet(state.fleet);
+    const promise = this.executeWorkflow(
+      current,
+      fleet,
+      this.preparedDefinition(definition, fleet),
+    );
     this.track(runID, promise.controller, promise.run);
     return current;
   }
@@ -317,23 +339,51 @@ export class RunService {
       onUpdate: (snapshot: WorkflowRun) =>
         this.store.saveRun(snapshot).then(() => undefined),
     };
-    const execution = definition.kind === "script"
-      ? runScriptWorkflow(
+    const execution = (async () => {
+      if (definition.kind === "module") {
+        return runModuleWorkflow(
+          this.runner,
+          fleet,
+          run.sessionID,
+          definition,
+          run.input,
+          common,
+        );
+      }
+      if (definition.kind === "script") {
+        return runScriptWorkflow(
+          this.runner,
+          fleet,
+          run.sessionID,
+          definition,
+          run.input,
+          common,
+        );
+      }
+      await this.waitUntilRunnable(run, controller.signal);
+      const routed = await routeWorkflowAssignments({
+        runner: this.runner,
+        fleet,
+        parentSessionID: run.sessionID,
+        definition,
+        task: run.input,
+        signal: controller.signal,
+        runID: run.id,
+      });
+      run.steps.forEach((step) => {
+        const assigned = routed.steps.find((item) => item.id === step.id);
+        if (assigned?.memberID) step.memberID = assigned.memberID;
+      });
+      await this.store.saveRun(run);
+      return runWorkflow(
         this.runner,
         fleet,
         run.sessionID,
-        definition,
-        run.input,
-        common,
-      )
-      : runWorkflow(
-        this.runner,
-        fleet,
-        run.sessionID,
-        definition,
+        routed,
         run.input,
         common,
       );
+    })();
     const execute = execution.then(async (finished) => {
       if (controller.signal.aborted && finished.status === "cancelled") {
         const reason = String(controller.signal.reason);
@@ -417,6 +467,19 @@ export class RunService {
   private resultForExisting(run: DurableRun) {
     if (run.status === "interrupted") return run;
     return run;
+  }
+
+  private workflowFleet(fleet: Fleet, selection: SessionSelection = {}) {
+    return applySessionModel(fleet, selection);
+  }
+
+  private preparedDefinition(
+    definition: WorkflowDefinition,
+    fleet: Fleet,
+  ): WorkflowDefinition {
+    return isDagWorkflow(definition)
+      ? assignFleetToWorkflow(definition, fleet)
+      : definition;
   }
 }
 

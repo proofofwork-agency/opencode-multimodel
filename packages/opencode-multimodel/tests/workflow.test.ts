@@ -113,7 +113,71 @@ describe("declarative workflow runtime", () => {
       "failed",
       "cancelled",
     ]);
-    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls.map((call) => call.member.id)).toEqual([
+      "lead",
+      "worker",
+    ]);
+    expect(run.steps[0]?.error).toContain("worker: step failed");
+  });
+
+  test("falls back to the next fleet seat when the assigned member fails", async () => {
+    const runner: AgentRunner = {
+      async run(input) {
+        if (input.member.id === "lead") throw new Error("usage limit");
+        return {
+          memberID: input.member.id,
+          sessionID: `session-${input.member.id}`,
+          model: input.member.model,
+          text: "patched",
+        };
+      },
+    };
+    const run = await runWorkflow(
+      runner,
+      fleet,
+      "parent",
+      { name: "fallback", steps: [{ id: "change", prompt: "implement" }] },
+      "",
+    );
+    expect(run.status).toBe("completed");
+    expect(run.steps[0]).toMatchObject({
+      status: "completed",
+      memberID: "worker",
+    });
+    expect(run.steps[0]?.output).toContain("Fell back to worker");
+    expect(run.steps[0]?.output).toContain("patched");
+  });
+
+  test("times out a hung seat and continues on the next member", async () => {
+    const runner: AgentRunner = {
+      async run(input) {
+        if (input.member.id === "lead") {
+          await new Promise((_, reject) => {
+            input.signal?.addEventListener("abort", () => {
+              reject(new Error(String(input.signal?.reason ?? "aborted")));
+            }, { once: true });
+          });
+        }
+        return {
+          memberID: input.member.id,
+          sessionID: `session-${input.member.id}`,
+          model: input.member.model,
+          text: "done after hang",
+        };
+      },
+    };
+    const run = await runWorkflow(
+      runner,
+      fleet,
+      "parent",
+      { name: "hang", steps: [{ id: "change", prompt: "implement" }] },
+      "",
+      { seatTimeoutMs: 20 },
+    );
+    expect(run.status).toBe("completed");
+    expect(run.steps[0]?.memberID).toBe("worker");
+    expect(run.steps[0]?.output).toContain("timed out");
+    expect(run.steps[0]?.output).toContain("done after hang");
   });
 
   test("allows dependents when the failed step declares continueOnError", async () => {
@@ -132,7 +196,8 @@ describe("declarative workflow runtime", () => {
       "failed",
       "completed",
     ]);
-    expect(runner.calls[1]?.prompt).toBe("Use step failed");
+    expect(runner.calls.at(-1)?.prompt).toContain("Use ");
+    expect(runner.calls.at(-1)?.prompt).toContain("step failed");
   });
 
   test("rejects cycles before execution", () => {

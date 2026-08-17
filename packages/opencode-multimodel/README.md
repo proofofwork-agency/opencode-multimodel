@@ -17,17 +17,22 @@ only OpenCode's public plugin and SDK APIs.
 ## What it adds
 
 - `/lead` selects the model that owns assignments, synthesis, and verdicts.
-- `/fleet` opens an interactive fleet manager: Enter toggles participants, and
-  actions add any connected model, choose the lead, remove seats, or open the
-  detailed fleet screen.
+- `/fleet` (alias `/workflow-fleet`) is the model pool a workflow picks from.
+  Enter toggles seats; actions add any connected model (including Codex
+  delegate), choose the lead, remove seats, or open the detailed fleet screen.
 - `/collab` interactively selects `lead`, `pair`, `round`, `council`,
   `orchestrate`, `handoff`, `panel`, `deliberate`, or `jury`, then prefills the
   native session composer so the request and result stay in the normal chat.
-- `/workflow` selects and runs a saved DAG or confined script workflow.
+- `/workflow` starts a Claude Code-style dynamic workflow for a task, or runs
+  a saved DAG or confined script when you name one.
 - `/mode` and the clickable composer badge select `SINGLE`, `TEAM`, or
   `WORKFLOW` without replacing OpenCode's native prompt implementation.
-- `/workflows`, `/runs`, and `/graph` expose definitions, the durable event
-  ledger, live run status, and fleet routing.
+  `WORKFLOW` uses the current session model by default, not the fleet's
+  provider default.
+- `/workflows` is a nested tile board: active runs on the left, task tiles
+  with LEAD/WORK agents in the center, and a free-text overview on the right.
+  Click an agent to inspect the prompt it is executing. `/runs` and `/graph`
+  still expose the ledger and fleet routing.
 - Server tools provide explicit fleet, collaboration, run-control, and
   workflow capabilities in API/headless OpenCode sessions.
 
@@ -55,7 +60,7 @@ Install the alpha channel from npm:
         "workflows": {
           "scripts": false,
           "directories": [".opencode/workflows"],
-          "timeoutMs": 300000,
+          "timeoutMs": 900000,
           "maxAgentCalls": 64
         },
         "retention": {
@@ -129,11 +134,12 @@ The multi-model plugin treats every seat as an ordinary OpenCode `{ providerID, 
 
 Authentication and billing remain the delegate provider's responsibility. If that provider uses the Codex CLI subscription session, child fleet calls use the same subscription path and share its rate limits. This plugin does not convert API-key billing into subscription usage or bypass provider limits.
 
-Slash-command adapters use OpenCode's configured `small_model` when present.
-This lets `/collab`, `/workflow`, and `/fleet` call OpenCode tools even when the
-currently selected primary model is a delegate provider whose native CLI tool
-surface does not include OpenCode plugin tools. The delegate still participates
-normally as a fleet child.
+`/collab`, `/lead`, and `/fleet` adapters use OpenCode's configured
+`small_model` when present so they can call plugin tools even if the current
+primary model is a tool-less delegate. `/workflow` and `/workflows` use the
+current session model instead, so a dynamic run is not stuck on a provider
+default or a stale `small_model`. The delegate still participates normally as
+a fleet child.
 
 A tool-only delegate cannot be selected as a fleet model. It must expose a provider/model pair first.
 
@@ -153,6 +159,25 @@ A tool-only delegate cannot be selected as a fleet model. It must expose a provi
 All modes enforce a model-call budget. Worker failures are preserved in council/orchestrate output so a healthy lead can still synthesize. Nested multi-model and Codex-delegate orchestration tools are disabled inside child sessions, while ordinary OpenCode implementation tools remain available. Runs may be foreground or background and can be inspected, steered, cancelled, or explicitly resumed through `multimodel_run`.
 
 ## Workflows
+
+Workflow mode matches Claude Code's dynamic-workflow modus: you give a task,
+the plugin starts an understand → change → verify run, and every unspecified
+agent uses the **current session model** (not the provider default the fleet
+was discovered with). Saved named workflows remain available.
+
+```text
+/workflow audit every route handler for missing auth checks
+```
+
+`WORKFLOW` composer mode does the same for ordinary prompts. `/workflow name
+<input>` still runs a saved definition when `name` matches exactly.
+
+Add models with `/fleet` or `/workflow-fleet`. Any enabled seat can take any
+step. Unassigned steps are auto-routed by task kind (explore / implement /
+review): for example a Codex delegate is preferred for change/code, the lead
+for understand/plan, and an independent seat for verify. The lead then
+reviews that plan and can remap any unassigned step onto any fleet model.
+A step that already names a `memberID` keeps it. Synthesis stays on the lead.
 
 `kind: "dag"` workflows are safe JSON dependency graphs. The `kind` may be
 omitted for compatibility with definitions saved by `0.1.x`.
@@ -219,9 +244,9 @@ auto-merges them.
 The TUI registers replace-slots for the home and session composers but renders
 OpenCode's own `api.ui.Prompt` inside them. `SINGLE` calls native submit without
 modification. `TEAM` rewrites ordinary input to `/collab <mode> …`, and
-`WORKFLOW` rewrites it to `/workflow <name> …`. Attachments remain on the native
-prompt object. Shell mode, existing slash commands, and leading `@` input are
-never rewritten.
+`WORKFLOW` rewrites it to `/workflow <task>` or `/workflow <name> …` when a
+saved definition is selected. Attachments remain on the native prompt object.
+Shell mode, existing slash commands, and leading `@` input are never rewritten.
 
 `composer.autoRoute` defaults to `false`. When enabled, explicit multi-model
 language selects TEAM and only an exact `workflow:<saved-name>` or

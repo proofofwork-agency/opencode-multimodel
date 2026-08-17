@@ -2,10 +2,17 @@ import { isAbsolute, resolve } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import {
+  DYNAMIC_WORKFLOW_NAME,
+  SessionSelectionCache,
+  mergeSessionSelection,
+  resolveRunnableWorkflow,
+} from "./dynamic.ts";
+import {
   adaptPluginClient,
   asOpenCodeClient,
   discoverFleet,
   OpenCodeAgentRunner,
+  resolveSessionSelection,
 } from "./opencode.ts";
 import { RunService } from "./orchestration.ts";
 import { parseOptions } from "./options.ts";
@@ -50,6 +57,7 @@ const server: Plugin = async (input, rawOptions) => {
   await loadWorkflowDirectories(store, input.directory, options.workflows);
   const runner = new OpenCodeAgentRunner(client, store);
   const runs = new RunService(store, runner, options);
+  const selections = new SessionSelectionCache();
   const readState = async (discover = false) => {
     const state = await store.read();
     if (!discover || options.fleet || state.fleet.members.length > 0) {
@@ -95,14 +103,24 @@ Parsing rules:
 4. The prompt is required. If text remains after a recognized mode, the tool's prompt argument MUST contain that complete text verbatim and MUST NOT be empty.`,
       };
       config.command.workflow ??= {
-        description: "Run a durable multi-model workflow",
-        model: commandModel,
-        template:
-          "Call multimodel_workflow with action=run. Treat the first argument as name and the remaining text as input: $ARGUMENTS",
+        description:
+          "Run a saved workflow, or start a dynamic understand-change-verify workflow on the session model",
+        template: `Act only as a deterministic command adapter. Do not answer the user's request yourself. Call multimodel_workflow exactly once and return its tool result verbatim.
+
+The raw command arguments are between the delimiters below:
+<multimodel_arguments>
+$ARGUMENTS
+</multimodel_arguments>
+
+Parsing rules:
+1. If the arguments are empty, call action=list.
+2. Read the first whitespace-delimited token.
+3. If it is the exact name of a saved workflow, call action=run with name set to that token and copy every remaining character into input.
+4. Otherwise omit name and copy ALL raw command arguments into input. This starts a dynamic workflow for that task.
+5. The input is required for a run. Never pass an empty input for a task, and never answer the task yourself.`,
       };
       config.command.workflows ??= {
         description: "List multi-model workflows and recent runs",
-        model: commandModel,
         template:
           "Call multimodel_workflow with action=list. Return the tool result.",
       };
@@ -329,7 +347,7 @@ Parsing rules:
               }
               const validated = validateWorkflowScript(definition.source);
               definition.sourceHash = validated.sourceHash;
-            } else {
+            } else if (definition.kind !== "module") {
               validateWorkflow(definition);
             }
             await store.saveWorkflow(definition);
@@ -355,40 +373,67 @@ Parsing rules:
             }
             return runOutput((await store.getRun(runID))!);
           }
-          const name = requireText(args.name, "name");
-          const definition = state.workflows.find((workflow) =>
-            workflow.name === name
+          const resolved = resolveRunnableWorkflow(
+            state.workflows,
+            args.name,
+            args.input ?? "",
           );
-          if (!definition) throw new Error(`Workflow ${name} does not exist.`);
-          if (definition.kind === "script" && !options.workflows.scripts) {
+          if (resolved.definition.kind === "script" && !options.workflows.scripts) {
             throw new Error("Script workflows are disabled by configuration.");
           }
-          const pattern = definition.kind === "script"
-            ? `${definition.name}:${workflowSourceHash(definition.source)}`
-            : definition.name;
+          const pattern = resolved.dynamic
+            ? DYNAMIC_WORKFLOW_NAME
+            : resolved.definition.kind === "script" ||
+                resolved.definition.kind === "module"
+              ? `${resolved.definition.name}:${workflowSourceHash(resolved.definition.source)}`
+              : resolved.definition.name;
           await context.ask({
             permission: "multimodel.workflow",
             patterns: [pattern],
             always: [pattern],
             metadata: {
-              workflow: definition.name,
-              kind: definition.kind ?? "dag",
-              sourceHash: definition.kind === "script"
-                ? workflowSourceHash(definition.source)
+              workflow: resolved.definition.name,
+              kind: resolved.definition.kind ?? "dag",
+              dynamic: resolved.dynamic,
+              sourceHash: resolved.definition.kind === "script" ||
+                  resolved.definition.kind === "module"
+                ? workflowSourceHash(resolved.definition.source)
                 : undefined,
               background: args.background === true,
             },
           });
+          const session = mergeSessionSelection(
+            selections.get(context.sessionID),
+            await resolveSessionSelection(client, context.sessionID),
+            { agent: context.agent },
+          );
           return runOutput(await runs.startWorkflow({
             sessionID: context.sessionID,
             messageID: context.messageID,
-            definition,
-            input: args.input ?? "",
+            definition: resolved.definition,
+            input: resolved.input,
             background: args.background,
             signal: args.background ? undefined : context.abort,
+            sessionModel: session.model,
+            sessionAgent: session.agent,
           }));
         },
       }),
+    },
+    "chat.message": async (input) => {
+      if (!input.model?.providerID || !input.model.modelID) return;
+      selections.remember(input.sessionID, {
+        model: input.model,
+        agent: input.agent,
+      });
+    },
+    async "experimental.chat.system.transform"(input, output) {
+      if (!input.sessionID) return;
+      const stored = await store.getSessionMode(input.sessionID);
+      if (stored?.mode !== "workflow") return;
+      output.system.push(
+        "This session is in WORKFLOW mode. For a user task that is not already a slash command, call multimodel_workflow with action=run and put the complete task in input. Omit name unless the user named a saved workflow. Do not answer the task yourself.",
+      );
     },
     async dispose() {
       await runs.dispose();
@@ -412,11 +457,19 @@ function formatWorkflows(
   workflows: WorkflowDefinition[],
   runs: DurableRun[],
 ) {
-  if (workflows.length === 0) return "No workflows saved.";
+  if (workflows.length === 0) {
+    return "No saved workflows. /workflow <task> starts a dynamic understand-change-verify run on the current session model.";
+  }
   return [
     ...workflows.map((workflow) =>
       workflow.kind === "script"
         ? `${workflow.name} · script · sha256:${workflow.sourceHash ?? workflowSourceHash(workflow.source)}`
+        : workflow.kind === "module"
+        ? `${workflow.name} · ts · ${(workflow.phases ?? []).map((phase) =>
+          typeof phase === "string" ? phase : phase.title
+        ).join(" → ") || "module"}${
+          workflow.description ? ` · ${workflow.description}` : ""
+        }`
         : `${workflow.name} · dag · ${workflow.steps.length} steps${workflow.description ? ` · ${workflow.description}` : ""}`
     ),
     "",
