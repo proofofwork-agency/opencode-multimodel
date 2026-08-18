@@ -169,6 +169,7 @@ explicitly.
     "requireHostProof": true,
     "judge": true,
     "judgeModel": "anthropic/claude-sonnet-4-5",
+    "judgeGateTurns": 3,
     "defaultMaxTurns": 25,
     "defaultMaxDurationSeconds": 3600,
     "wrapupRatio": 0.8,
@@ -187,6 +188,16 @@ explicitly.
 - `judgeModel` pins the independent judge (and contract author fallback model
   selection is unchanged) to a `provider/model` string; unset uses the session's
   current model.
+- `judgeGateTurns` (default 3, `0` = always) gates the polling judge: judge
+  inference only runs after this many meaningful continuation turns (tools
+  used or substantial output). The completion-claim gate
+  (`update_goal status=complete`) always runs the full audit regardless.
+- **Trajectory loop detection**: tool calls are fingerprinted into a bounded
+  per-goal trace; a repeating tool cycle (same call, ping-pong, or period-3
+  cycle) pauses the goal with `pauseReason: loop` — but only when the
+  worker's output stopped evolving (legitimate build→test→fix iteration with
+  changing results is exempt). Resuming after a loop pause tells the worker
+  which cycle was detected and to choose a different approach.
 - `noProgressTokenThreshold` / `maxNoProgressTurns` pause the loop after
   repeated continuation turns whose reported output tokens stay below the
   threshold. Output tokens are only counted when the host reports them; unknown
@@ -248,6 +259,6 @@ bun run benchmark
 
 `bun run benchmark` runs a deterministic, provider-free behavior benchmark
 (completion gating, contract tamper, loop safety, wrap-up, interrupt,
-recovery, ownership, plan mode, multi-goal sequences) that exits non-zero
-when any scenario fails. See `docs/comparison.md` for the scorecard against
+recovery, ownership, plan mode, multi-goal sequences, judge gate, loop
+detection) that exits non-zero when any scenario fails. See `docs/comparison.md` for the scorecard against
 other goal plugins.

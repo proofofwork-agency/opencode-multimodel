@@ -222,6 +222,10 @@ export function lastAssistantText(messages: SessionTurn[]) {
   return textFromParts(lastAssistantTurn(messages)?.parts ?? []);
 }
 
+export function turnText(turn: SessionTurn | undefined) {
+  return turn ? textFromParts(turn.parts) : "";
+}
+
 export function turnHadTools(turn: SessionTurn | undefined) {
   return turn ? partsHaveTools(turn.parts) : false;
 }

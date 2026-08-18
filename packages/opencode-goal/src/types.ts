@@ -28,6 +28,7 @@ export const PAUSE_REASONS = [
   "owned",
   "plan",
   "no_progress",
+  "loop",
   "queued",
   "recovery",
 ] as const;
@@ -99,6 +100,7 @@ export type Goal = {
   history: GoalHistoryEntry[];
   checkpoints: GoalCheckpoint[];
   lastCheckpoint?: GoalCheckpoint;
+  toolTrace: string[];
   createdAt: number;
   updatedAt: number;
 };
@@ -196,6 +198,7 @@ export function goalFromSnapshot(snapshot: GoalSnapshot): Goal {
     lastVerdict: snapshot.lastVerdict,
     lastCheckpoint: snapshot.lastCheckpoint,
     checkpoints: snapshot.lastCheckpoint ? [snapshot.lastCheckpoint] : [],
+    toolTrace: [],
     contractPath: snapshot.contractPath,
     contractHash: snapshot.contractHash,
     createdAt: snapshot.updatedAt,
@@ -213,6 +216,7 @@ export function defaultGoalFields(): Pick<
   | "dogfood"
   | "focused"
   | "autoPromote"
+  | "toolTrace"
   | "history"
   | "checkpoints"
 > {
@@ -225,6 +229,7 @@ export function defaultGoalFields(): Pick<
     dogfood: true,
     focused: true,
     autoPromote: false,
+    toolTrace: [],
     history: [],
     checkpoints: [],
   };

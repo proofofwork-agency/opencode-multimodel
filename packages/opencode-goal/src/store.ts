@@ -58,6 +58,7 @@ type GoalRow = {
   contract_hash: string | null;
   history_json: string | null;
   checkpoints_json: string | null;
+  tool_trace_json: string | null;
   focused: number;
   auto_promote: number;
   created_at: number;
@@ -490,8 +491,8 @@ export class GoalStore {
         last_evidence, blocker, last_verdict, last_verdict_reason,
         last_verdict_at, last_prompt_kind, last_prompt_agent, steer_until,
         contract_path, contract_hash, history_json, checkpoints_json,
-        focused, auto_promote, created_at, updated_at
-      ) VALUES (${Array.from({ length: 39 }, () => "?").join(", ")})
+        tool_trace_json, focused, auto_promote, created_at, updated_at
+      ) VALUES (${Array.from({ length: 40 }, () => "?").join(", ")})
       ON CONFLICT(session_id, goal_id) DO UPDATE SET
         goal_id = excluded.goal_id,
         objective = excluded.objective,
@@ -527,6 +528,7 @@ export class GoalStore {
         contract_hash = excluded.contract_hash,
         history_json = excluded.history_json,
         checkpoints_json = excluded.checkpoints_json,
+        tool_trace_json = excluded.tool_trace_json,
         focused = excluded.focused,
         auto_promote = excluded.auto_promote,
         created_at = excluded.created_at,
@@ -567,6 +569,7 @@ export class GoalStore {
       goal.contractHash ?? null,
       JSON.stringify(goal.history),
       JSON.stringify(goal.checkpoints),
+      JSON.stringify(goal.toolTrace),
       goal.focused ? 1 : 0,
       goal.autoPromote ? 1 : 0,
       goal.createdAt,
@@ -700,6 +703,9 @@ export class GoalStore {
         checkpoints_json: has("checkpoints_json")
           ? (row.checkpoints_json as string | null) ?? "[]"
           : "[]",
+        tool_trace_json: has("tool_trace_json")
+          ? (row.tool_trace_json as string | null) ?? "[]"
+          : "[]",
         focused: has("focused") ? Number(row.focused ?? 1) : 1,
         auto_promote: has("auto_promote") ? Number(row.auto_promote ?? 0) : 0,
         created_at: Number(row.created_at ?? 0),
@@ -748,6 +754,7 @@ const GOALS_DDL = `
         contract_hash TEXT,
         history_json TEXT NOT NULL DEFAULT '[]',
         checkpoints_json TEXT NOT NULL DEFAULT '[]',
+        tool_trace_json TEXT NOT NULL DEFAULT '[]',
         focused INTEGER NOT NULL DEFAULT 1,
         auto_promote INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
@@ -763,6 +770,7 @@ export function resolvePath(directory: string, path: string) {
 function hydrate(row: GoalRow): Goal {
   const checks = parseChecks(row.checks_json);
   const checkpoints = parseCheckpoints(row.checkpoints_json);
+  const toolTrace = parseTrace(row.tool_trace_json);
   return {
     sessionID: row.session_id,
     goalID: row.goal_id,
@@ -797,6 +805,7 @@ function hydrate(row: GoalRow): Goal {
     contractHash: row.contract_hash ?? undefined,
     history: parseHistory(row.history_json),
     checkpoints,
+    toolTrace,
     lastCheckpoint: checkpoints.at(-1),
     focused: row.focused === 1,
     autoPromote: row.auto_promote === 1,
@@ -824,6 +833,16 @@ function parseChecks(raw: string) {
     return Array.isArray(value)
       ? value.filter((item): item is string => typeof item === "string")
       : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseTrace(raw: string | null | undefined) {
+  try {
+    const value = JSON.parse(raw ?? "[]");
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is string => typeof item === "string");
   } catch {
     return [];
   }

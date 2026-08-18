@@ -49,6 +49,7 @@ async function harness(input: {
 } = {}): Promise<Harness & { service: GoalService }> {
   const directory = await mkdtemp(join(tmpdir(), "goal-bench-"));
   const prompts: string[] = [];
+  const judgeCalls: string[] = [];
   const client: Harness["client"] = {
     busy: false,
     promptOutputTokens: input.promptOutputTokens,
@@ -94,10 +95,12 @@ async function harness(input: {
       reason: "Dogfood run passed.",
       output: "ok",
     }),
-    evaluate: async () =>
-      input.evaluate ?? { verdict: "not_met", reason: "still working" },
+    evaluate: async () => {
+      judgeCalls.push("call");
+      return input.evaluate ?? { verdict: "not_met", reason: "still working" };
+    },
   });
-  return { directory, prompts, client, service };
+  return { directory, prompts, judgeCalls, client, service };
 }
 
 function activeGoal(goal: Goal | undefined) {
@@ -414,6 +417,80 @@ await scenario(
       service.get("ses")?.status === "active";
     service.close();
     return addOk && focusOk && queueOk && promoted;
+  },
+);
+
+await scenario(
+  "judge-gate",
+  "polling judge inference only runs after meaningful turns reach the gate, not every idle",
+  async () => {
+    const bench = await harness();
+    const { service, judgeCalls } = bench;
+    await service.apply("ses", {
+      action: "set",
+      objective: "ship",
+      checks: [],
+    }, { start: false });
+    await service.handleIdle("ses");
+    await service.handleIdle("ses");
+    await service.handleIdle("ses");
+    const gated = judgeCalls.length === 0;
+    await service.handleIdle("ses");
+    const judged = judgeCalls.length === 1;
+    service.close();
+    return gated && judged;
+  },
+);
+
+await scenario(
+  "loop-detector",
+  "a repeating tool cycle with frozen output pauses the goal with reason loop",
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "goal-bench-"));
+    const grep = (letter: string) => ([
+      { type: "tool", tool: "bash", args: { command: `grep ${letter} src` } },
+      { type: "text", text: "no matches found" },
+    ]);
+    const turns = [grep("A"), grep("B"), grep("A"), grep("B"), grep("A"), grep("B"), grep("A")];
+    let index = 0;
+    const service = new GoalService({
+      ...parseOptions({
+        databasePath: join(directory, "goal.sqlite"),
+        snapshotDir: join(directory, "goals"),
+        minDelayMs: 0,
+      }),
+      directory,
+      client: {
+        async prompt() {
+          return { text: "working", hadTools: true, tokens: 20 };
+        },
+        async session() {
+          return {};
+        },
+        async messages() {
+          const parts = turns[index] ?? [];
+          index += 1;
+          return [
+            { role: "user", parts: [{ type: "text", text: "go" }] },
+            { role: "assistant", parts: parts as never },
+          ];
+        },
+      },
+      now: () => 1_000,
+      evaluate: async () => ({ verdict: "not_met", reason: "working" }),
+    });
+    await service.apply("ses", {
+      action: "set",
+      objective: "ship",
+      checks: [],
+    }, { start: false });
+    for (let turn = 0; turn < 8; turn += 1) {
+      await service.handleIdle("ses");
+      if (service.get("ses")?.pauseReason === "loop") break;
+    }
+    const goal = service.get("ses");
+    service.close();
+    return goal?.status === "paused" && goal?.pauseReason === "loop";
   },
 );
 

@@ -25,6 +25,7 @@ function goal(partial: Partial<Goal> = {}): Goal {
     autoPromote: false,
     history: [],
     checkpoints: [],
+    toolTrace: [],
     createdAt: 0,
     updatedAt: 0,
     ...partial,

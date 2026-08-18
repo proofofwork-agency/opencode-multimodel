@@ -10,6 +10,7 @@ export type GoalOptions = {
   requireHostProof: boolean;
   judge: boolean;
   judgeModel?: string;
+  judgeGateTurns: number;
   noToolTurnsBeforeSuppress: number;
   noProgressTokenThreshold: number;
   maxNoProgressTurns: number;
@@ -42,6 +43,7 @@ const ALLOWED = [
   "requireHostProof",
   "judge",
   "judgeModel",
+  "judgeGateTurns",
   "noToolTurnsBeforeSuppress",
   "noProgressTokenThreshold",
   "maxNoProgressTurns",
@@ -96,6 +98,13 @@ export function parseOptions(
     ),
     judge: optionalBoolean(input.judge, "judge", true),
     judgeModel: optionalString(input.judgeModel, "judgeModel"),
+    judgeGateTurns: optionalInteger(
+      input.judgeGateTurns,
+      "judgeGateTurns",
+      3,
+      0,
+      50,
+    ),
     noToolTurnsBeforeSuppress: optionalInteger(
       input.noToolTurnsBeforeSuppress,
       "noToolTurnsBeforeSuppress",

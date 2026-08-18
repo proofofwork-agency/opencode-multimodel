@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +21,7 @@ async function setup(input: {
   const prompts: string[] = [];
   const synthetic: boolean[] = [];
   const aborted: string[] = [];
+  const judgeCalls: string[] = [];
   const client = {
     busy: false,
     async prompt(request: { sessionID: string; text: string; synthetic?: boolean }) {
@@ -68,12 +69,15 @@ async function setup(input: {
       reason: "Dogfood run passed.",
       output: "ok",
     }),
-    evaluate: async () => input.evaluate ?? {
-      verdict: "not_met",
-      reason: "still working",
+    evaluate: async () => {
+      judgeCalls.push("call");
+      return input.evaluate ?? {
+        verdict: "not_met",
+        reason: "still working",
+      };
     },
   });
-  return { directory, prompts, synthetic, aborted, client, service };
+  return { directory, prompts, synthetic, aborted, judgeCalls, client, service };
 }
 
 test("sets a goal and starts a work turn", async () => {
@@ -683,4 +687,190 @@ test("idle sessions without goals are never locked by maybeContinue", async () =
   db.close();
   expect(rows).toEqual([]);
   service.close();
+});
+
+describe("deterministic judge gate", () => {
+  test("skips judge inference until judgeGateTurns meaningful turns passed", async () => {
+    const { service, judgeCalls } = await setup();
+    await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+      start: false,
+    });
+    // Each handleIdle accounts the finished turn, applies the gate, then
+    // sends a continuation with hadTools=true (meaningful). The judge runs
+    // on the fourth idle (third meaningful turn).
+    await service.handleIdle("ses");
+    await service.handleIdle("ses");
+    await service.handleIdle("ses");
+    expect(judgeCalls.length).toBe(0);
+    await service.handleIdle("ses");
+    expect(judgeCalls.length).toBe(1);
+    service.close();
+  });
+
+  test("judgeGateTurns 0 restores always-judge behavior", async () => {
+    const { service, judgeCalls } = await setup({
+      options: { judgeGateTurns: 0 },
+    });
+    await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+      start: false,
+    });
+    await service.handleIdle("ses");
+    expect(judgeCalls.length).toBe(1);
+    service.close();
+  });
+});
+
+describe("trajectory loop detection", () => {
+  type LoopSetup = {
+    service: import("../src/engine.ts").GoalService;
+    prompts: string[];
+  };
+
+  async function loopSetup(
+    traceTurns: unknown[][],
+  ): Promise<LoopSetup> {
+    const directory = await mkdtemp(join(tmpdir(), "opencode-goal-loop-"));
+    const prompts: string[] = [];
+    let index = 0;
+    const service = new GoalService({
+      ...parseOptions({
+        databasePath: join(directory, "goal.sqlite"),
+        snapshotDir: join(directory, "goals"),
+        minDelayMs: 0,
+      }),
+      directory,
+      client: {
+        async prompt(request: { sessionID: string; text: string }) {
+          prompts.push(request.text);
+          return { text: "working", hadTools: true, tokens: 20 };
+        },
+        async session() {
+          return {};
+        },
+        async messages() {
+          const parts = traceTurns[index] ?? [];
+          index += 1;
+          return [
+            { role: "user", parts: [{ type: "text", text: "go" }] },
+            { role: "assistant", parts: parts as never },
+          ];
+        },
+      },
+      now: () => 1_000,
+      evaluate: async () => ({ verdict: "not_met", reason: "working" }),
+    });
+    return { service, prompts };
+  }
+
+  test("ping-pong tool cycle with frozen checkpoints pauses with reason loop", async () => {
+    const grepParts = (letter: string) => [
+      { type: "tool", tool: "bash", args: { command: `grep ${letter} src` } },
+      { type: "text", text: "no matches found" },
+    ];
+    const { service } = await loopSetup([
+      grepParts("A"),
+      grepParts("B"),
+      grepParts("A"),
+      grepParts("B"),
+      grepParts("A"),
+      grepParts("B"),
+      grepParts("A"),
+    ]);
+    await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+      start: false,
+    });
+    for (let turn = 0; turn < 8; turn += 1) {
+      await service.handleIdle("ses");
+      const goal = service.get("ses");
+      if (goal?.status === "paused") break;
+    }
+    const goal = service.get("ses");
+    expect(goal?.status).toBe("paused");
+    expect(goal?.pauseReason).toBe("loop");
+    expect(goal?.blocker).toContain("grep");
+    service.close();
+  });
+
+  test("evolving checkpoints keep a legitimate iteration cycle running", async () => {
+    // Identical build->test->fix tool cycle, but every turn reports
+    // different findings, so judge checkpoints evolve and the loop
+    // detector exempts the cycle as legitimate iteration.
+    const cycle = (step: number) => [
+      { type: "tool", tool: "bash", args: { command: "npm run build" } },
+      { type: "tool", tool: "bash", args: { command: "npm test" } },
+      { type: "tool", tool: "edit", args: { file: "fix.ts" } },
+      { type: "text", text: `iteration ${step}: tests ${step}/12 passing` },
+    ];
+    const directory = await mkdtemp(join(tmpdir(), "opencode-goal-loop-"));
+    const prompts: string[] = [];
+    let index = 0;
+    const service = new GoalService({
+      ...parseOptions({
+        databasePath: join(directory, "goal.sqlite"),
+        snapshotDir: join(directory, "goals"),
+        minDelayMs: 0,
+        judgeGateTurns: 1,
+      }),
+      directory,
+      client: {
+        async prompt(request: { sessionID: string; text: string }) {
+          prompts.push(request.text);
+          return { text: "working", hadTools: true, tokens: 20 };
+        },
+        async session() {
+          return {};
+        },
+        async messages() {
+          const parts = [
+            cycle(1), cycle(2), cycle(3), cycle(4), cycle(5), cycle(6),
+            cycle(7), cycle(8),
+          ][index] ?? [];
+          index += 1;
+          return [
+            { role: "user", parts: [{ type: "text", text: "go" }] },
+            { role: "assistant", parts: parts as never },
+          ];
+        },
+      },
+      now: () => 1_000,
+      evaluate: async () => ({ verdict: "not_met", reason: "working" }),
+    });
+    await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+      start: false,
+    });
+    for (let turn = 0; turn < 8; turn += 1) {
+      await service.handleIdle("ses");
+    }
+    const goal = service.get("ses");
+    expect(goal?.pauseReason === "loop").toBe(false);
+    service.close();
+  });
+
+  test("continuation prompt after a loop pause names the pattern", async () => {
+    const grepParts = (letter: string) => [
+      { type: "tool", tool: "bash", args: { command: `grep ${letter} src` } },
+      { type: "text", text: "no matches found" },
+    ];
+    const { service, prompts } = await loopSetup([
+      grepParts("A"),
+      grepParts("B"),
+      grepParts("A"),
+      grepParts("B"),
+      grepParts("A"),
+      grepParts("B"),
+      grepParts("A"),
+    ]);
+    await service.apply("ses", { action: "set", objective: "ship", checks: [] }, {
+      start: false,
+    });
+    for (let turn = 0; turn < 8; turn += 1) {
+      await service.handleIdle("ses");
+      if (service.get("ses")?.pauseReason === "loop") break;
+    }
+    expect(service.get("ses")?.pauseReason).toBe("loop");
+    await service.apply("ses", { action: "resume" }, { start: false });
+    await service.handleIdle("ses");
+    expect(prompts.at(-1)).toContain("loop was detected");
+    service.close();
+  });
 });

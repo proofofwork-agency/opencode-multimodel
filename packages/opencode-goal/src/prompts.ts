@@ -69,7 +69,7 @@ export function continuationPrompt(goal: Goal) {
     "Before deciding that the goal is achieved, perform a completion audit against the actual current state.",
     "If the objective is achieved, call update_goal with status \"complete\" and include the evidence that proves it.",
     "If the goal cannot continue without user input, call update_goal with status \"unmet\" and the blocker.",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 export function budgetLimitPrompt(goal: Goal) {

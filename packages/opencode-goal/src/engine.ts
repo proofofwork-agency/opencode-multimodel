@@ -13,6 +13,11 @@ import { readContractFile, verifyContractHash } from "./contract.ts";
 import { type EvidenceClaim, inspectClaim } from "./evidence.ts";
 import { formatHistory, pushHistory, recordCheckpoint } from "./history.ts";
 import { noProgressShouldPause } from "./limits.ts";
+import {
+  appendTrace,
+  detectToolLoop,
+  toolFingerprints,
+} from "./trajectory.ts";
 import { judgePrompt, parseJudgeOutput, type JudgeResult } from "./judge.ts";
 import { isRestrictedAgent, type GoalOptions } from "./options.ts";
 import {
@@ -24,6 +29,7 @@ import {
   parseModelRef,
   tokenTotal,
   turnHadTools,
+  turnText,
   type GoalClient,
 } from "./opencode.ts";
 import {
@@ -80,6 +86,8 @@ export class GoalService {
   private readonly inflight = new Set<string>();
   private readonly humanTurns = new Map<string, number>();
   private readonly judgeFailures = new Map<string, number>();
+  private readonly turnsSinceJudge = new Map<string, number>();
+  private readonly loopNotes = new Map<string, string>();
   private readonly watchdogs = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(options: GoalServiceOptions) {
@@ -685,8 +693,9 @@ export class GoalService {
     }
     const queuedUserInput = this.consumeQueuedHuman(sessionID);
     const childrenBusy = await this.childrenBusy(sessionID);
-    await this.accountLatestTurn(sessionID);
-    await this.refreshVerdict(sessionID);
+    const messages = await this.client?.messages?.(sessionID) ?? [];
+    await this.accountLatestTurn(sessionID, messages);
+    await this.refreshVerdict(sessionID, messages);
     return this.maybeContinue(sessionID, {
       agent: session?.agent,
       queuedUserInput,
@@ -844,12 +853,33 @@ export class GoalService {
     return childrenAreBusy(children, statuses);
   }
 
-  private async refreshVerdict(sessionID: string) {
+  private async refreshVerdict(
+    sessionID: string,
+    messages?: import("./opencode.ts").SessionTurn[],
+  ) {
     const goal = this.store.get(sessionID);
     if (!goal || goal.status !== "active") return;
-    const messages = await this.client?.messages?.(sessionID) ?? [];
-    const transcript = lastAssistantText(messages);
+    // Deterministic judge gate: polling judge inference is only spent when
+    // the worker did meaningful work this turn (tools or substantial
+    // output) and every judgeGateTurns meaningful turns as a safety net.
+    // judgeGateTurns: 0 restores always-judge behavior. The completion
+    // claim path (completeFromModel) is always fully gated and unaffected.
+    const gate = this.options.judgeGateTurns;
+    if (gate > 0) {
+      const meaningful = goal.lastHadTools ||
+        (goal.lastVerdict?.verdict === "met");
+      if (!meaningful) return;
+      const counted = (this.turnsSinceJudge.get(sessionID) ?? 0) + 1;
+      if (counted < gate) {
+        this.turnsSinceJudge.set(sessionID, counted);
+        return;
+      }
+    }
+    const turns = messages ??
+      (await this.client?.messages?.(sessionID) ?? []);
+    const transcript = lastAssistantText(turns);
     const judged = await this.evaluate(goal, { transcript });
+    this.turnsSinceJudge.set(sessionID, 0);
     if (!judged) return;
     const unusable = judged.verdict === "not_met" &&
       (judged.reason.includes("unusable") || judged.reason.includes("no text") ||
@@ -968,10 +998,17 @@ export class GoalService {
       : kind === "budget_limit"
       ? budgetLimitPrompt(goal)
       : continuationPrompt(goal);
+    const loopNote = kind === "continuation"
+      ? this.loopNotes.get(goal.sessionID)
+      : undefined;
+    if (loopNote) this.loopNotes.delete(goal.sessionID);
+    const promptText = loopNote
+      ? `${text}\n\nA loop was detected in the previous turns: ${loopNote} Choose a different approach; do not repeat the same tool calls.`
+      : text;
     try {
       const result = await this.client.prompt({
         sessionID: goal.sessionID,
-        text,
+        text: promptText,
         synthetic: true,
         agent: goal.lastPromptAgent,
       });
@@ -1040,10 +1077,14 @@ export class GoalService {
     }
   }
 
-  private async accountLatestTurn(sessionID: string) {
+  private async accountLatestTurn(
+    sessionID: string,
+    preloaded?: import("./opencode.ts").SessionTurn[],
+  ) {
     const goal = this.store.get(sessionID);
     if (!goal || !this.client?.messages) return;
-    const messages = await this.client.messages(sessionID);
+    const messages = preloaded ??
+      (await this.client.messages(sessionID));
     const turn = lastAssistantTurn(messages);
     if (!turn) return;
     this.store.account(sessionID, goal.goalID, {
@@ -1052,10 +1093,36 @@ export class GoalService {
     if (goal.lastPromptKind === "continuation") {
       const hadTools = turnHadTools(turn);
       const streak = hadTools ? 0 : goal.noToolStreak + 1;
+      const fingerprints = toolFingerprints(turn);
+      const toolTrace = appendTrace(goal.toolTrace, fingerprints);
+      const loop = hadTools
+        ? detectToolLoop({
+          toolTrace,
+          checkpoints: goal.checkpoints.map((checkpoint) => checkpoint.summary),
+          currentTranscript: turnText(turn),
+        })
+        : undefined;
+      if (loop) {
+        this.loopNotes.set(sessionID, loop.description);
+        this.persist(pushHistory(
+          this.mustUpdate(sessionID, goal.goalID, {
+            lastHadTools: hadTools,
+            noToolStreak: streak,
+            toolTrace,
+            status: "paused",
+            pauseReason: "loop",
+            blocker: loop.description,
+          }),
+          "error",
+          `Loop detected: ${loop.description}`,
+        ));
+        return;
+      }
       this.persist(
         this.store.update(sessionID, goal.goalID, {
           lastHadTools: hadTools,
           noToolStreak: streak,
+          toolTrace,
           continuationSuppressed: shouldSuppressNextContinuation({
             hadTools,
             wasContinuation: true,

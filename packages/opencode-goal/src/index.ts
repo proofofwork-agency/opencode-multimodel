@@ -15,6 +15,13 @@ export type { ContinuationContext, ContinuationDecision } from "./policy.ts";
 export { auditCompletion, inspectClaim, citedFiles } from "./evidence.ts";
 export { parseJudgeOutput, judgePrompt } from "./judge.ts";
 export type { JudgeResult, JudgeInput } from "./judge.ts";
+export {
+  detectToolLoop,
+  detectPureCycle,
+  toolFingerprints,
+  appendTrace,
+} from "./trajectory.ts";
+export type { LoopPattern, LoopDetection } from "./trajectory.ts";
 export { GoalService, createGoalService, GoalOwnedError } from "./engine.ts";
 export {
   continuationPrompt,
