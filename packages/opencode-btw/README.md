@@ -29,8 +29,16 @@ about the current session:
 4. Deletes the child session. The question and answer never enter the parent
    transcript.
 
+`/btw --send <question>` answers the same way, then merges the question and
+answer into the parent session as a user message so the main agent can act
+on it in its next turn. Without `--send` the exchange stays ephemeral.
+
 Recent side exchanges stay in an in-memory, session-scoped history ring
 (`/btw-history` or `ctrl+b`) that is cleared on exit.
+
+> **Publishing note**: the npm package name `opencode-btw` is taken by an
+> unrelated hint-injection plugin. Publish this package under a scoped or
+> renamed package name before leaving alpha.
 
 ## Options
 

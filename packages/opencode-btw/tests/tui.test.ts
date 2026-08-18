@@ -231,3 +231,49 @@ describe("TUI streaming wiring", () => {
     expect(handlers.size).toBe(1);
   });
 });
+
+describe("btw --send merge-back", () => {
+  test("--send merges the answered side question into the parent session", async () => {
+    const { api, state } = fakeApi();
+    const prompts: Array<Record<string, unknown>> = [];
+    (api.client as { session: { prompt: unknown } }).session.prompt = async (
+      input: Record<string, unknown>,
+    ) => {
+      prompts.push(input);
+      return { data: { info: {}, parts: [{ type: "text", text: "the answer" }] } };
+    };
+    await startTui(api);
+    await command(state, "btw.ask").run({ input: "--send what changed?" });
+    await settle();
+    await settle();
+    expect(prompts.length).toBeGreaterThanOrEqual(1);
+    const merged = prompts.at(-1) as { sessionID?: string; parts?: Array<{ text: string }> };
+    expect(merged.sessionID).toBe("parent");
+    const text = merged.parts?.[0]?.text ?? "";
+    expect(text).toContain("Side question");
+    expect(text).toContain("what changed?");
+    expect(text).toContain("the answer");
+    expect(
+      state.toasts.some((toast) => /merged into the session/.test(toast.message)),
+    ).toBe(true);
+  });
+
+  test("without --send the parent transcript is never touched", async () => {
+    const { api, state } = fakeApi();
+    const prompts: Array<Record<string, unknown>> = [];
+    (api.client as { session: { prompt: unknown } }).session.prompt = async (
+      input: Record<string, unknown>,
+    ) => {
+      prompts.push(input);
+      return { data: { info: {}, parts: [{ type: "text", text: "the answer" }] } };
+    };
+    await startTui(api);
+    await command(state, "btw.ask").run({ input: "just curious?" });
+    await settle();
+    await settle();
+    // Only the child-session prompts from the side runner; the parent never
+    // receives a merged message without --send.
+    const parentPrompts = prompts.filter((input) => input.sessionID === "parent");
+    expect(parentPrompts).toEqual([]);
+  });
+});

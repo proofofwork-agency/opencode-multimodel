@@ -11,7 +11,7 @@ import { asBtwClient } from "./client.ts";
 import { parseOptions } from "./options.ts";
 import { SideRegistry } from "./registry.ts";
 import { BtwError, SideRunner, type SideExchange } from "./runner.ts";
-import { btwSlashQuestion } from "./slash.ts";
+import { btwSlashQuestion, parseBtwRequest } from "./slash.ts";
 
 const SUBMIT_PRIORITY = 20_000;
 
@@ -65,6 +65,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
         api,
         runner,
         registry,
+        client,
         setOverlay,
         options,
         question,
@@ -88,6 +89,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
             api,
             runner,
             registry,
+            client,
             setOverlay,
             options,
             typeof input.input === "string" ? input.input : "",
@@ -107,6 +109,7 @@ const tui: TuiPlugin = async (api, rawOptions) => {
             api,
             runner,
             registry,
+            client,
             setOverlay,
             options,
             typeof input.input === "string" ? input.input : "",
@@ -140,6 +143,7 @@ async function runSideQuestion(
   api: TuiPluginApi,
   runner: SideRunner,
   registry: SideRegistry,
+  client: ReturnType<typeof asBtwClient>,
   setOverlay: Setter<OverlayState | null>,
   options: ReturnType<typeof parseOptions>,
   rawInput: string,
@@ -149,7 +153,9 @@ async function runSideQuestion(
     toast(api, "Open a session before asking a side question.", "warning");
     return;
   }
-  let question = rawInput.trim();
+  const parsed = parseBtwRequest(rawInput) ?? { question: "", send: false };
+  let question = parsed.question.trim();
+  const send = parsed.send;
   if (!question) {
     question = await promptForQuestion(api);
     if (!question) return;
@@ -183,6 +189,29 @@ async function runSideQuestion(
         }
         : current,
     );
+    if (send) {
+      const merged = [
+        `Side question (answered by ${exchange.model ?? "a side session"}):`,
+        question,
+        "",
+        "Answer:",
+        exchange.answer,
+      ].join("\n");
+      const sent = await client.session.prompt({
+        sessionID,
+        parts: [{ type: "text", text: merged }],
+      }).then(
+        () => true,
+        () => false,
+      );
+      toast(
+        api,
+        sent
+          ? "Side answer merged into the session."
+          : "Could not merge the side answer into the session.",
+        sent ? "success" : "warning",
+      );
+    }
     if (options.notify) {
       void api.attention.notify({
         title: "btw answered",
