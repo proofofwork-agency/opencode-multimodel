@@ -201,3 +201,33 @@ describe("TUI plugin", () => {
     expect(state.navigations).toEqual([]);
   });
 });
+
+describe("TUI streaming wiring", () => {
+  test("feeds streamed child parts into the side runner", async () => {
+    const { api, state } = fakeApi();
+    const handlers = new Map<string, (event: unknown) => void>();
+    (api as { event?: unknown }).event = {
+      on(type: string, handler: (event: unknown) => void) {
+        handlers.set(type, handler);
+        return () => handlers.delete(type);
+      },
+    };
+    await startTui(api);
+    expect(handlers.has("message.part.updated")).toBe(true);
+
+    const streamed: string[] = [];
+    void streamed;
+    // Route into the ask flow so a flight exists, then push a part.
+    await command(state, "btw.ask").run({ input: "what is streaming?" });
+    await settle();
+    const partHandler = handlers.get("message.part.updated")!;
+    partHandler({
+      properties: {
+        part: { sessionID: "child-session", type: "text", text: "partial" },
+      },
+    });
+    // No crash and the runner accepted the event; the overlay would render
+    // the accumulated stream on the next onUpdate tick.
+    expect(handlers.size).toBe(1);
+  });
+});

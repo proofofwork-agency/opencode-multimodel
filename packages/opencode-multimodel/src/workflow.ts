@@ -424,7 +424,13 @@ function cancelBlockedSteps(
 }
 
 function findRunStep(run: WorkflowRun, id: string): WorkflowStepRun {
-  return run.steps.find((step) => step.id === id)!;
+  const step = run.steps.find((item) => item.id === id);
+  if (!step) {
+    throw new Error(
+      `Workflow step ${id} is missing from the run. The definition changed; start a new run.`,
+    );
+  }
+  return step;
 }
 
 function isTerminal(step: WorkflowStepRun) {

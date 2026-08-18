@@ -2,6 +2,8 @@ import { collaborate } from "./collaborate.ts";
 import {
   applySessionModel,
   assignFleetToWorkflow,
+  defaultDynamicWorkflow,
+  DYNAMIC_WORKFLOW_NAME,
   routeWorkflowAssignments,
   type SessionSelection,
 } from "./dynamic.ts";
@@ -165,9 +167,14 @@ export class RunService {
       return current;
     }
     const state = await this.store.read();
-    const definition = state.workflows.find((item) =>
+    let definition = state.workflows.find((item) =>
       item.name === current.definition
     );
+    if (!definition && isWorkflowRun(current) &&
+      current.definition === DYNAMIC_WORKFLOW_NAME
+    ) {
+      definition = defaultDynamicWorkflow(current.input);
+    }
     if (!definition) {
       throw new Error(`Workflow ${current.definition} no longer exists.`);
     }
@@ -185,7 +192,7 @@ export class RunService {
     const promise = this.executeWorkflow(
       current,
       fleet,
-      this.preparedDefinition(definition, fleet),
+      this.resumableDefinition(this.preparedDefinition(definition, fleet), current),
     );
     this.track(runID, promise.controller, promise.run);
     return current;
@@ -220,6 +227,11 @@ export class RunService {
     const run = await this.requireRun(runID);
     if (!isWorkflowRun(run)) {
       throw new Error("restart-agent is only available for workflow runs.");
+    }
+    if (this.active.has(runID)) {
+      throw new Error(
+        `Run ${runID} is still executing. Pause or stop it before restarting an agent step.`,
+      );
     }
     const index = run.steps.findIndex((step) => step.id === stepID);
     if (index === -1) throw new Error(`Run ${runID} has no step ${stepID}.`);
@@ -263,7 +275,7 @@ export class RunService {
       run.status = "running";
       run.error = undefined;
       await this.store.saveRun(run);
-      await this.waitUntilRunnable(run, controller.signal);
+      await this.waitUntilRunnable(run, controller);
       let writes = Promise.resolve();
       try {
         const result = await collaborate(
@@ -353,7 +365,7 @@ export class RunService {
       maxParallel: this.options.maxParallel,
       timeoutMs: this.options.workflows.timeoutMs,
       beforeStep: (snapshot: WorkflowRun) =>
-        this.waitUntilRunnable(snapshot, controller.signal),
+        this.waitUntilRunnable(snapshot, controller),
       onUpdate: (snapshot: WorkflowRun) =>
         this.store.saveRun(snapshot).then(() => undefined),
     };
@@ -378,7 +390,7 @@ export class RunService {
           common,
         );
       }
-      await this.waitUntilRunnable(run, controller.signal);
+      await this.waitUntilRunnable(run, controller);
       if (run.status === "pending" || run.status === "paused") {
         run.status = "running";
         await this.store.saveRun(run);
@@ -429,11 +441,20 @@ export class RunService {
     return { controller, run: execute };
   }
 
-  private async waitUntilRunnable(run: DurableRun, signal: AbortSignal) {
+  private async waitUntilRunnable(
+    run: DurableRun,
+    controller: AbortController,
+  ) {
+    const signal = controller.signal;
     for (;;) {
       signal.throwIfAborted();
       const control = await this.store.getRunControl(run.id);
       if (control === "stop") {
+        // Abort the local controller so the executing engine classifies
+        // this as a stop (not a failure) and the in-flight child session
+        // is actually aborted, even when the stop came from another process.
+        controller.abort("Run stopped by user.");
+        signal.throwIfAborted();
         throw new DOMException("Run stopped by user.", "AbortError");
       }
       if (control === "run") {
@@ -463,7 +484,7 @@ export class RunService {
     promise: Promise<DurableRun>,
   ) {
     const heartbeat = setInterval(
-      () => void this.store.renewLease(runID),
+      () => void this.store.renewLease(runID).catch(() => undefined),
       10_000,
     );
     this.active.set(runID, { controller, promise, heartbeat });
@@ -503,6 +524,38 @@ export class RunService {
     return isDagWorkflow(definition)
       ? assignFleetToWorkflow(definition, fleet)
       : definition;
+  }
+
+  /**
+   * Guard a resumed DAG against definition edits and restore the seat
+   * routing recorded on the persisted run, so a resume neither crashes on
+   * missing steps nor silently re-routes everything back to the lead.
+   */
+  private resumableDefinition(
+    definition: WorkflowDefinition,
+    run: DurableRun,
+  ): WorkflowDefinition {
+    if (!isDagWorkflow(definition) || !isWorkflowRun(run)) return definition;
+    const ids = new Set(definition.steps.map((step) => step.id));
+    const missing = run.steps
+      .filter((step) => !ids.has(step.id))
+      .map((step) => step.id);
+    if (missing.length > 0) {
+      throw new Error(
+        `Workflow ${run.definition} changed since this run (missing steps: ${
+          missing.join(", ")
+        }). Start a new run instead of resuming.`,
+      );
+    }
+    return {
+      ...definition,
+      steps: definition.steps.map((step) => {
+        const recorded = run.steps.find((item) => item.id === step.id);
+        return recorded?.memberID && !step.memberID
+          ? { ...step, memberID: recorded.memberID }
+          : step;
+      }),
+    };
   }
 }
 

@@ -34,6 +34,16 @@ const tui: TuiPlugin = async (api, rawOptions) => {
   });
   const [overlay, setOverlay] = createSignal<OverlayState | null>(null);
 
+  // Feed streamed child parts into the runner so the answer overlay can
+  // render live output while the side question is being answered.
+  api.lifecycle.onDispose(
+    api.event?.on("message.part.updated", (event) => {
+      const part = (event as { properties?: { part?: unknown } })
+        .properties?.part;
+      if (part) runner.consumePartEvent(part);
+    }) ?? (() => undefined),
+  );
+
   api.route.register([
     {
       name: ROUTE_ANSWER,
