@@ -29,9 +29,9 @@ evidence below. Competitor claims come from their published READMEs.
 | 9 | Model selection | inherit / small_model / explicit provider-model (options.ts; tested) | parent model (fork semantics) |
 | 10 | Agent-facing tool (side channel for the main agent) | yes — optional `btw` tool (server.ts; agent registration tested) | no |
 | 11 | History | in-memory session-scoped ring (/btw-history, ctrl+b), cleared on exit — nothing persists | fork persists until ended/merged |
-| 12 | Multi-turn side conversation | no (one-shot by design) | yes (fork) |
-| 13 | OpenCode V2 (opencode2) | no | yes, dual V1/V2 from one package |
-| 14 | Real-TUI integration tests | unit + TUI-adapter tests against test doubles (46/46) | pty-driven real-TUI integration suite |
+| 12 | Multi-turn side conversation | yes — `/btw --thread` keeps the child alive with thread context, follow-up `--thread` questions continue it, `--end` closes+deletes (runner threads; tested) | yes (fork) |
+| 13 | OpenCode V2 (opencode2) | experimental entry (`opencode-btw/oc2`): command + tools register and load on beta-17519; model-invoked plugin-tool execution is unreliable in the beta's Code Mode runtime (documented) | yes, dual V1/V2 from one package |
+| 14 | Real-TUI integration tests | unit + TUI-adapter tests against test doubles (48/48) | pty-driven real-TUI integration suite |
 | 15 | npm publish readiness | scoped name reserved-following convention, unblocked (was: name collision, now renamed) | 26 releases published |
 
 ## Where we lead
@@ -46,28 +46,42 @@ evidence below. Competitor claims come from their published READMEs.
    parent transcript unless the user explicitly asks (`--send`).
 4. **Streaming parity with an isolation model** (row 5): live partials in
    the overlay without giving the child tools.
+5. **Multi-turn with isolation intact** (row 12): `--thread` keeps the
+   tool-less child alive across follow-ups — bytheway gets multi-turn only
+   by forking a fully-armed session.
 
 ## Where they lead (honest gaps)
 
-1. Multi-turn side conversations (row 12) — a different product shape
-   (inhabiting a fork) rather than a one-shot side question.
-2. OpenCode V2 support (row 13) — roadmap for us.
-3. Real-pty integration tests (row 14) — our 46 tests are against doubles;
+1. OpenCode V2 support (row 13): bytheway ships a finished dual-runtime; our
+   OC2 entry is experimental because the beta's Code Mode runtime fails to
+   execute plugin tools (verified live on beta-17519; command and tool
+   registration themselves work).
+2. Real-pty integration tests (row 14) — our 48 tests are against doubles;
    pty tests are a CI-hardening follow-up.
+
+## Survey completeness
+
+npm search (`opencode btw`, `opencode side`, `opencode sidequest`,
+`opencode question plugin`) plus the OpenCode ecosystem docs found exactly
+one other OpenCode side-question plugin: opencode-bytheway. `opencode-btw`
+(kldzj) is a different category (hint injection); `opencode-side-panel-sessions`
+is a sidebar display; the pi-btw family and `@elyracode/btw` target other
+agent hosts (Pi, Elyra). The matrix above therefore covers the complete
+OpenCode side-question field.
 
 ## Parity/superiority verdict
 
 For the side-question use case (ask without contaminating or arming), ours
-is the strongest implementation: equal or better on 12 of 15 criteria, with
-a structurally safer isolation model, and the npm publish blocker is
-resolved by the scoped rename. The gaps are a different product shape
-(multi-turn forks), V2 support, and test-harness hardening — none of which
-affect the one-shot side-question workflow this package targets.
+is the strongest implementation: equal or better on 13 of 15 criteria, with
+a structurally safer isolation model, multi-turn that preserves isolation,
+an agent-facing tool no competitor has, and the npm publish blocker
+resolved by the scoped rename. The remaining gaps are the OC2 beta runtime
+(host limitation, experimental entry shipped) and pty test hardening.
 
 ## Reproduce
 
 ```sh
 cd packages/opencode-btw
-bun test          # 46/46
+bun test          # 48/48
 bun run typecheck # tsc --noEmit
 ```

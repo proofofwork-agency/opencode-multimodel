@@ -33,6 +33,15 @@ about the current session:
 answer into the parent session as a user message so the main agent can act
 on it in its next turn. Without `--send` the exchange stays ephemeral.
 
+`/btw --thread <question>` opens a multi-turn side conversation: the child
+session survives between questions and follow-up `--thread` questions
+continue it with full thread context (still tool-less and isolated).
+`/btw --end` closes and deletes the thread.
+
+An experimental OpenCode 2 (beta) entry exists at `opencode-btw/oc2`
+(command + tools register; the beta's Code Mode runtime currently fails to
+execute plugin tools — see docs/comparison.md).
+
 Recent side exchanges stay in an in-memory, session-scoped history ring
 (`/btw-history` or `ctrl+b`) that is cleared on exit.
 

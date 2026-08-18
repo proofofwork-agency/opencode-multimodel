@@ -153,9 +153,23 @@ async function runSideQuestion(
     toast(api, "Open a session before asking a side question.", "warning");
     return;
   }
-  const parsed = parseBtwRequest(rawInput) ?? { question: "", send: false };
+  const parsed = parseBtwRequest(rawInput) ?? {
+    question: "",
+    send: false,
+    thread: false,
+    end: false,
+  };
   let question = parsed.question.trim();
   const send = parsed.send;
+  if (parsed.end) {
+    const closed = await runner.endThread(sessionID).catch(() => false);
+    toast(
+      api,
+      closed ? "Side thread closed." : "No open side thread for this session.",
+      closed ? "success" : "info",
+    );
+    return;
+  }
   if (!question) {
     question = await promptForQuestion(api);
     if (!question) return;
@@ -168,16 +182,27 @@ async function runSideQuestion(
   });
   api.route.navigate(ROUTE_ANSWER, { returnRoute });
   try {
-    const exchange = await runner.ask({
-      sessionID,
-      question,
-      onUpdate: (text) =>
-        setOverlay((current) =>
-          current && current.question === question
-            ? { ...current, text }
-            : current,
-        ),
-    });
+    const exchange = parsed.thread
+      ? await runner.askThread({
+        sessionID,
+        question,
+        onUpdate: (text) =>
+          setOverlay((current) =>
+            current && current.question === question
+              ? { ...current, text }
+              : current,
+          ),
+      })
+      : await runner.ask({
+        sessionID,
+        question,
+        onUpdate: (text) =>
+          setOverlay((current) =>
+            current && current.question === question
+              ? { ...current, text }
+              : current,
+          ),
+      });
     registry.record(exchange);
     setOverlay((current) =>
       current && current.question === question

@@ -359,3 +359,50 @@ describe("BtwError", () => {
     expect(error.message).toBe("nope");
   });
 });
+
+describe("SideRunner threads", () => {
+  test("askThread keeps the child alive and continues it on the next call", async () => {
+    const { client, state } = fakeClient();
+    const runner = new SideRunner(client, fastOptions());
+    const first = await runner.askThread({
+      sessionID: "parent",
+      question: "what is this codebase?",
+    });
+    expect(first.answer).toBe("side answer");
+    expect(state.deleted).toEqual([]);
+    const child = runner.threadChild("parent");
+    expect(child).toBeDefined();
+
+    const second = await runner.askThread({
+      sessionID: "parent",
+      question: "and the entry point?",
+    });
+    expect(second.answer).toBe("side answer");
+    // Continuation prompts the SAME child; no snapshot parts, only the question.
+    expect(state.created).toHaveLength(1);
+    const lastPrompt = state.prompted.at(-1)!;
+    expect(lastPrompt.sessionID).toBe(child!);
+    // Continuation sends only the question part (single text part), no snapshot preamble.
+    expect(lastPrompt.parts).toHaveLength(1);
+    expect(state.deleted).toEqual([]);
+
+    expect(runner.endThread("parent")).resolves.toBe(true);
+    await runner.endThread("parent");
+    expect(state.deleted).toContain(child!);
+    expect(runner.threadChild("parent")).toBeUndefined();
+  });
+
+  test("plain ask never leaves a child behind even after thread usage", async () => {
+    const { client, state } = fakeClient();
+    const runner = new SideRunner(client, fastOptions());
+    await runner.askThread({ sessionID: "parent", question: "start thread" });
+    const oneShot = await runner.ask({ sessionID: "parent", question: "quick one" });
+    expect(oneShot.answer).toBe("side answer");
+    const threadChild = runner.threadChild("parent");
+    expect(threadChild).toBeDefined();
+    // The one-shot child was deleted; the thread child survives.
+    expect(state.deleted).toHaveLength(1);
+    expect(state.deleted[0]).not.toBe(threadChild);
+    await runner.endThread("parent");
+  });
+});

@@ -38,6 +38,7 @@ export type BtwErrorCode =
   | "BUSY"
   | "SNAPSHOT"
   | "CHILD_SESSION"
+  | "CHILD_GONE"
   | "MODEL"
   | "TIMEOUT"
   | "ABORTED"
@@ -93,9 +94,19 @@ type InFlight = {
   onUpdate?: (text: string) => void;
 };
 
+type Flight = {
+  question: string;
+  model: ModelRef | undefined;
+  snapshot: ReturnType<typeof renderSnapshot>;
+  childSessionID: string;
+  startedAt: number;
+  inFlight: InFlight;
+};
+
 export class SideRunner {
   private readonly inFlight = new Map<string, InFlight>();
   private readonly children = new Set<string>();
+  private readonly threads = new Map<string, string>();
 
   constructor(
     private readonly client: BtwClient,
@@ -108,6 +119,127 @@ export class SideRunner {
   }
 
   async ask(input: SideAskInput): Promise<SideExchange> {
+    const prepared = await this.createFlight(input);
+    try {
+      return await this.flightExchange(prepared, input);
+    } catch (error) {
+      throw this.classify(error, input);
+    } finally {
+      await this.closeFlight(prepared.childSessionID);
+    }
+  }
+
+  /**
+   * Multi-turn side conversation: the child session survives between
+   * questions so follow-ups keep the thread context. `/btw --end` (or
+   * session deletion) closes and deletes it.
+   */
+  threadChild(sessionID: string): string | undefined {
+    return this.threads.get(sessionID);
+  }
+
+  async askThread(input: SideAskInput): Promise<SideExchange> {
+    const existing = this.threads.get(input.sessionID);
+    if (existing && this.inFlight.has(existing)) {
+      throw new BtwError(
+        "BUSY",
+        "The side thread is still answering a question.",
+      );
+    }
+    if (existing) {
+      try {
+        const exchange = await this.continueThread(existing, input);
+        return exchange;
+      } catch (error) {
+        if (error instanceof BtwError && error.code === "CHILD_GONE") {
+          this.threads.delete(input.sessionID);
+        } else {
+          throw error;
+        }
+      }
+    }
+    const prepared = await this.createFlight(input);
+    try {
+      const exchange = await this.flightExchange(prepared, input);
+      this.threads.set(input.sessionID, prepared.childSessionID);
+      this.inFlight.delete(prepared.childSessionID);
+      return exchange;
+    } catch (error) {
+      throw this.classify(error, input);
+    } finally {
+      if (!this.threads.has(input.sessionID)) {
+        await this.closeFlight(prepared.childSessionID);
+      } else {
+        this.inFlight.delete(prepared.childSessionID);
+      }
+    }
+  }
+
+  async endThread(sessionID: string): Promise<boolean> {
+    const child = this.threads.get(sessionID);
+    if (!child) return false;
+    this.threads.delete(sessionID);
+    await this.client.session.abort({ sessionID: child }).catch(
+      () => undefined,
+    );
+    await this.client.session.delete({ sessionID: child }).catch(
+      () => undefined,
+    );
+    this.children.delete(child);
+    this.inFlight.delete(child);
+    return true;
+  }
+
+  private async continueThread(
+    childSessionID: string,
+    input: SideAskInput,
+  ): Promise<SideExchange> {
+    const question = input.question.trim();
+    if (!question) {
+      throw new BtwError("EMPTY_QUESTION", "A /btw side question is required.");
+    }
+    const model = this.resolveModel(undefined);
+    const flight: InFlight = {
+      parentSessionID: input.sessionID,
+      childSessionID,
+      streams: new Map(),
+      onUpdate: input.onUpdate,
+    };
+    this.inFlight.set(childSessionID, flight);
+    const startedAt = Date.now();
+    try {
+      const answer = await this.promptChild({
+        childSessionID,
+        model,
+        parts: [{ type: "text", text: btwSidePrompt(question) }],
+        signal: input.signal,
+        onUpdate: input.onUpdate,
+      });
+      return {
+        id: crypto.randomUUID(),
+        parentSessionID: input.sessionID,
+        question,
+        answer,
+        status: "answered",
+        model: model ? `${model.providerID}/${model.modelID}` : undefined,
+        childSessionID,
+        createdAt: startedAt,
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      if (
+        error instanceof BtwError &&
+        (error.code === "CHILD_SESSION" || error.code === "MODEL_ERROR")
+      ) {
+        throw Object.assign(error, { code: "CHILD_GONE" });
+      }
+      throw error;
+    } finally {
+      this.inFlight.delete(childSessionID);
+    }
+  }
+
+  private async createFlight(input: SideAskInput): Promise<Flight> {
     const question = input.question.trim();
     if (!question) {
       throw new BtwError("EMPTY_QUESTION", "A /btw side question is required.");
@@ -157,6 +289,59 @@ export class SideRunner {
       onUpdate: input.onUpdate,
     };
     this.inFlight.set(childSessionID, flight);
+    return {
+      question,
+      model,
+      snapshot,
+      childSessionID,
+      startedAt,
+      inFlight: flight,
+    };
+  }
+
+  private async flightExchange(
+    prepared: Flight,
+    input: SideAskInput,
+  ): Promise<SideExchange> {
+    const answer = await this.promptChild({
+      childSessionID: prepared.childSessionID,
+      model: prepared.model,
+      parts: [
+        {
+          type: "text",
+          text: `${btwSnapshotPreamble(
+            prepared.snapshot.truncatedMessages,
+            prepared.snapshot.messageCount,
+          )}\n${prepared.snapshot.text}`,
+        },
+        { type: "text", text: btwSidePrompt(prepared.question) },
+      ],
+      signal: input.signal,
+      onUpdate: input.onUpdate,
+    });
+    return {
+      id: crypto.randomUUID(),
+      parentSessionID: input.sessionID,
+      question: prepared.question,
+      answer,
+      status: "answered",
+      model: prepared.model
+        ? `${prepared.model.providerID}/${prepared.model.modelID}`
+        : undefined,
+      childSessionID: prepared.childSessionID,
+      createdAt: prepared.startedAt,
+      durationMs: Date.now() - prepared.startedAt,
+    };
+  }
+
+  private async promptChild(input: {
+    childSessionID: string;
+    model?: ReturnType<SideRunner["resolveModel"]>;
+    parts: Array<{ type: "text"; text: string }>;
+    signal?: AbortSignal;
+    onUpdate?: (text: string) => void;
+  }): Promise<string> {
+    const childSessionID = input.childSessionID;
 
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -207,20 +392,11 @@ export class SideRunner {
     try {
       const promptPromise = this.client.session.prompt({
         sessionID: childSessionID,
-        model,
+        model: input.model,
         agent: BTW_AGENT_ID,
         system: BTW_AGENT_PROMPT,
         tools: BTW_DISABLED_TOOLS,
-        parts: [
-          {
-            type: "text",
-            text: `${btwSnapshotPreamble(
-              snapshot.truncatedMessages,
-              snapshot.messageCount,
-            )}\n${snapshot.text}`,
-          },
-          { type: "text", text: btwSidePrompt(question) },
-        ],
+        parts: input.parts,
       });
       promptPromise.catch(() => undefined);
       const response = await Promise.race([
@@ -253,36 +429,35 @@ export class SideRunner {
           "The side model returned no text answer.",
         );
       }
-      return {
-        id: crypto.randomUUID(),
-        parentSessionID: input.sessionID,
-        question,
-        answer,
-        status: "answered",
-        model: model ? `${model.providerID}/${model.modelID}` : undefined,
-        childSessionID,
-        createdAt: startedAt,
-        durationMs: Date.now() - startedAt,
-      };
-    } catch (error) {
-      const status = input.signal?.aborted
-        ? "cancelled"
-        : timedOut
-          ? "cancelled"
-          : "failed";
-      throw Object.assign(
-        error instanceof Error ? error : new Error(describe(error)),
-        { btwStatus: status },
-      );
+      return answer;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       input.signal?.removeEventListener("abort", abort);
-      this.inFlight.delete(childSessionID);
-      await this.client.session.delete({ sessionID: childSessionID }).catch(
-        () => undefined,
-      );
-      this.children.delete(childSessionID);
     }
+  }
+
+  private async closeFlight(childSessionID: string) {
+    this.inFlight.delete(childSessionID);
+    await this.client.session.delete({ sessionID: childSessionID }).catch(
+      () => undefined,
+    );
+    this.children.delete(childSessionID);
+    for (const [parent, child] of [...this.threads.entries()]) {
+      if (child === childSessionID) this.threads.delete(parent);
+    }
+  }
+
+  private classify(error: unknown, input: SideAskInput) {
+    const timedOut = error instanceof BtwError && error.code === "TIMEOUT";
+    const status = input.signal?.aborted
+      ? "cancelled"
+      : timedOut
+        ? "cancelled"
+        : "failed";
+    return Object.assign(
+      error instanceof Error ? error : new Error(describe(error)),
+      { btwStatus: status },
+    );
   }
 
   consumePartEvent(part: unknown): void {

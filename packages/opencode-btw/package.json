@@ -23,6 +23,10 @@
       "types": "./dist/tui.d.ts",
       "import": "./dist/tui.js"
     },
+    "./oc2": {
+      "types": "./dist/oc2.d.ts",
+      "import": "./dist/oc2.js"
+    },
     "./core": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
