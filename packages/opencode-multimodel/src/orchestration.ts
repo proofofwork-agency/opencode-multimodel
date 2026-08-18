@@ -244,7 +244,11 @@ export class RunService {
     });
     run.status = "interrupted";
     run.error = undefined;
-    await this.store.deleteAgentCallsFrom(runID, index);
+    // DAG agent calls are cached at stepIndex*100 + attempt while script
+    // and module calls are sequential; derive the truncation threshold in
+    // the right index space so earlier steps keep their replay cache.
+    const callThreshold = run.workflowKind === "dag" ? index * 100 : index;
+    await this.store.deleteAgentCallsFrom(runID, callThreshold);
     await this.store.saveRun(run);
     await this.store.appendEvent(runID, "agent.restart.requested", { stepID });
     return this.resume(runID);
@@ -255,14 +259,18 @@ export class RunService {
   }
 
   async dispose() {
+    // A plugin reload is not a user stop: leave in-flight runs resumable
+    // (interrupted + released leases) instead of cancelling them. The
+    // lease-expiry recovery path picks them up on the next boot.
     this.active.forEach((run) => {
       clearInterval(run.heartbeat);
-      run.controller.abort("Plugin disposed.");
+      run.controller.abort("Plugin disposed; run left interrupted.");
     });
     await Promise.allSettled(
       [...this.active.values()].map((run) => run.promise),
     );
     this.active.clear();
+    await this.store.releaseAllLeases().catch(() => undefined);
   }
 
   private executeCollaboration(
@@ -349,12 +357,43 @@ export class RunService {
     signal?: AbortSignal,
   ) {
     const controller = linkedController(signal);
-    const timeout = setTimeout(
-      () => controller.abort(
-        `Workflow timed out after ${this.options.workflows.timeoutMs} ms.`,
-      ),
-      this.options.workflows.timeoutMs,
-    );
+    // The wall-clock budget only elapses while the run is runnable: while
+    // paused, the timer is suspended so a long pause does not fail the run.
+    let budgetRemaining = this.options.workflows.timeoutMs;
+    let budgetStartedAt: number | undefined;
+    const chargeBudget = (start: boolean) => {
+      if (start) {
+        if (budgetStartedAt === undefined) budgetStartedAt = Date.now();
+        return;
+      }
+      if (budgetStartedAt !== undefined) {
+        budgetRemaining -= Date.now() - budgetStartedAt;
+        budgetStartedAt = undefined;
+      }
+    };
+    let timeout = setTimeout(fireTimeout, budgetRemaining);
+    function fireTimeout() {
+      controller.abort(
+        `Workflow timed out after remaining budget of ${Math.max(0, budgetRemaining)} ms.`,
+      );
+    }
+    const suspendBudget = () => {
+      chargeBudget(false);
+      clearTimeout(timeout);
+    };
+    const resumeBudget = () => {
+      if (budgetRemaining <= 0) {
+        fireTimeout();
+        return;
+      }
+      clearTimeout(timeout);
+      chargeBudget(true);
+      timeout = setTimeout(fireTimeout, budgetRemaining);
+    };
+    const budgetHooks = {
+      onPaused: suspendBudget,
+      onResumed: resumeBudget,
+    };
     const common = {
       signal: controller.signal,
       run,
@@ -365,7 +404,7 @@ export class RunService {
       maxParallel: this.options.maxParallel,
       timeoutMs: this.options.workflows.timeoutMs,
       beforeStep: (snapshot: WorkflowRun) =>
-        this.waitUntilRunnable(snapshot, controller),
+        this.waitUntilRunnable(snapshot, controller, budgetHooks),
       onUpdate: (snapshot: WorkflowRun) =>
         this.store.saveRun(snapshot).then(() => undefined),
     };
@@ -390,7 +429,7 @@ export class RunService {
           common,
         );
       }
-      await this.waitUntilRunnable(run, controller);
+      await this.waitUntilRunnable(run, controller, budgetHooks);
       if (run.status === "pending" || run.status === "paused") {
         run.status = "running";
         await this.store.saveRun(run);
@@ -444,8 +483,10 @@ export class RunService {
   private async waitUntilRunnable(
     run: DurableRun,
     controller: AbortController,
+    hooks?: { onPaused?: () => void; onResumed?: () => void },
   ) {
     const signal = controller.signal;
+    let announcedPause = false;
     for (;;) {
       signal.throwIfAborted();
       const control = await this.store.getRunControl(run.id);
@@ -458,6 +499,7 @@ export class RunService {
         throw new DOMException("Run stopped by user.", "AbortError");
       }
       if (control === "run") {
+        if (announcedPause) hooks?.onResumed?.();
         if (run.status === "paused") {
           run.status = "running";
           await this.store.saveRun(run);
@@ -467,6 +509,10 @@ export class RunService {
       if (run.status !== "paused") {
         run.status = "paused";
         await this.store.saveRun(run);
+      }
+      if (!announcedPause) {
+        announcedPause = true;
+        hooks?.onPaused?.();
       }
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(resolve, 250);
@@ -582,10 +628,13 @@ function linkedController(signal?: AbortSignal) {
   return controller;
 }
 
-function abortedStatus(signal: AbortSignal): "cancelled" | "stopped" {
-  return String(signal.reason).toLowerCase().includes("stopped")
-    ? "stopped"
-    : "cancelled";
+function abortedStatus(
+  signal: AbortSignal,
+): "cancelled" | "stopped" | "interrupted" {
+  const reason = String(signal.reason).toLowerCase();
+  if (reason.includes("stopped")) return "stopped";
+  if (reason.includes("disposed")) return "interrupted";
+  return "cancelled";
 }
 
 function initialCollaborationSteps(

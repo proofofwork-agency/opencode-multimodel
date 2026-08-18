@@ -31,45 +31,68 @@ export async function loadWorkflowDirectories(
       onlyFiles: true,
     })) files.push(file);
   }
+  let loaded = 0;
   for (const file of files.sort()) {
-    if (file.endsWith(".json")) {
-      const definition = parseWorkflowDefinition(await Bun.file(file).text());
-      if (definition.kind === "script") {
-        if (!options.scripts) continue;
-        definition.sourceHash = validateWorkflowScript(definition.source).sourceHash;
-      } else if (definition.kind !== "module") {
-        validateWorkflow(definition);
-      }
-      await store.saveWorkflow(definition);
-      continue;
+    try {
+      await loadWorkflowFile(store, file, options);
+      loaded += 1;
+    } catch (error) {
+      // One invalid file must not unload the whole plugin: skip it and
+      // record a load-failure event so the board shows why it is missing.
+      await store.appendEvent(
+        `workflow-load-${basename(file)}`,
+        "workflow.load.failed",
+        {
+          file,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      ).catch(() => undefined);
     }
-    const source = await Bun.file(file).text();
-    if (isModuleWorkflowSource(source)) {
-      validateModuleWorkflowSource(source);
-      const meta = extractWorkflowMeta(source);
-      await store.saveWorkflow({
-        kind: "module",
-        name: meta.name ?? basename(file).replace(/\.(?:js|ts)$/, ""),
-        description: meta.description,
-        whenToUse: meta.whenToUse,
-        phases: meta.phases,
-        arguments: meta.arguments,
-        path: file,
-        source,
-        sourceHash: workflowSourceHash(source),
-      });
-      continue;
-    }
-    if (!options.scripts) continue;
-    const definition = {
-      kind: "script" as const,
-      name: scriptName(source) ?? basename(file).replace(/\.(?:js|ts)$/, ""),
-      source,
-      sourceHash: validateWorkflowScript(source).sourceHash,
-    };
-    await store.saveWorkflow(definition);
   }
-  return files.length;
+  return loaded;
+}
+
+async function loadWorkflowFile(
+  store: StateStore,
+  file: string,
+  options: MultiModelOptions["workflows"],
+) {
+  if (file.endsWith(".json")) {
+    const definition = parseWorkflowDefinition(await Bun.file(file).text());
+    if (definition.kind === "script") {
+      if (!options.scripts) return;
+      definition.sourceHash = validateWorkflowScript(definition.source).sourceHash;
+    } else if (definition.kind !== "module") {
+      validateWorkflow(definition);
+    }
+    await store.saveWorkflow(definition);
+    return;
+  }
+  const source = await Bun.file(file).text();
+  if (isModuleWorkflowSource(source)) {
+    validateModuleWorkflowSource(source);
+    const meta = extractWorkflowMeta(source);
+    await store.saveWorkflow({
+      kind: "module",
+      name: meta.name ?? basename(file).replace(/\.(?:js|ts)$/, ""),
+      description: meta.description,
+      whenToUse: meta.whenToUse,
+      phases: meta.phases,
+      arguments: meta.arguments,
+      path: file,
+      source,
+      sourceHash: workflowSourceHash(source),
+    });
+    return;
+  }
+  if (!options.scripts) return;
+  const definition = {
+    kind: "script" as const,
+    name: scriptName(source) ?? basename(file).replace(/\.(?:js|ts)$/, ""),
+    source,
+    sourceHash: validateWorkflowScript(source).sourceHash,
+  };
+  await store.saveWorkflow(definition);
 }
 
 export function parseWorkflowDefinition(value: string): WorkflowDefinition {

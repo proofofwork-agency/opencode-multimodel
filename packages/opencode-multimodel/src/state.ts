@@ -1056,6 +1056,13 @@ export class StateStore {
       .run(runID, this.owner);
   }
 
+  /** Release every lease owned by this process (graceful dispose). */
+  async releaseAllLeases() {
+    await this.database
+      .query("DELETE FROM leases WHERE owner = ?")
+      .run(this.owner);
+  }
+
   private assertLeaseOwnerOrFreeSync(runID: string) {
     const owner = this.database
       .query<{ owner: string }, [string]>(

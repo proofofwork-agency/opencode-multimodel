@@ -122,7 +122,7 @@ describe("durable run control", () => {
     });
 
     expect(run.status).toBe("failed");
-    expect(run.error).toContain("timed out after 100 ms");
+    expect(run.error).toContain("timed out after remaining budget of 100 ms");
   });
 
   test("persists validation failures as durable failed runs", async () => {
@@ -335,5 +335,60 @@ describe("resume hardening", () => {
       "still executing",
     );
     await service.cancel(admitted.id);
+  });
+});
+
+describe("pause suspends the workflow budget", () => {
+  test("a paused run does not burn its timeout while idle", async () => {
+    const releases: Array<() => void> = [];
+    const runner: AgentRunner = {
+      async run(input) {
+        calls.push(input.prompt);
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+          input.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        return {
+          memberID: input.member.id,
+          sessionID: `child-${calls.length}`,
+          model: input.member.model,
+          text: `result-${calls.length}`,
+        };
+      },
+    };
+    const calls: string[] = [];
+    const { store, service } = await setup(runner, {
+      workflows: { timeoutMs: 400 },
+    });
+    const admitted = await service.startWorkflow({
+      sessionID: "parent",
+      messageID: "budget-message",
+      definition: {
+        kind: "dag",
+        name: "budget",
+        steps: [
+          { id: "one", prompt: "one" },
+          { id: "two", needs: ["one"], prompt: "two" },
+        ],
+      },
+      input: "",
+      background: true,
+    });
+    await waitFor(() => calls.length === 1);
+    await service.pause(admitted.id);
+    releases[0]!();
+    await waitFor(async () => (await store.getRun(admitted.id))?.status === "paused");
+    // Stay paused longer than the full timeout budget.
+    await Bun.sleep(600);
+    expect((await store.getRun(admitted.id))?.status).toBe("paused");
+
+    await service.resume(admitted.id);
+    await waitFor(() => calls.length === 2);
+    releases[1]!();
+    await waitFor(async () =>
+      (await store.getRun(admitted.id))?.status === "completed"
+    );
   });
 });
