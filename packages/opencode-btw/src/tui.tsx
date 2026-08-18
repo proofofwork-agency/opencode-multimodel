@@ -291,23 +291,48 @@ function AnswerScreen(props: {
   const history = props.registry.list(
     sessionIDFromParams(props.params),
   ).length;
+  const theme = props.api.theme.current;
   return (
-    <box width="100%" height="100%" flexDirection="column" padding={2} gap={1}>
+    <box
+      width="100%"
+      height="100%"
+      flexDirection="column"
+      justifyContent="flex-end"
+    >
+      <box
+        height="34%"
+        zIndex={50}
+        backgroundColor={theme.background}
+        borderStyle="single"
+        borderColor={theme.border}
+        flexDirection="column"
+        paddingTop={0}
+        paddingBottom={0}
+        paddingLeft={1}
+        paddingRight={1}
+      >
       <box flexDirection="row" justifyContent="space-between">
-        <text fg={props.api.theme.current.accent}>btw</text>
+        <text fg={theme.accent}>btw</text>
         <box
           onMouseUp={() => goBack(props.api, props.params)}
-          backgroundColor={props.api.theme.current.backgroundElement}
+          backgroundColor={theme.backgroundElement}
           paddingLeft={1}
           paddingRight={1}
         >
-          <text fg={props.api.theme.current.text}>
-            enter/esc · back{history > 0 ? ` · ${history} saved` : ""}
+          <text fg={theme.text}>
+            esc to close{history > 0 ? ` · ${history} saved` : ""}
           </text>
         </box>
       </box>
-      <box flexGrow={1} minHeight={0} flexDirection="column" gap={1}>
-        <text fg={props.api.theme.current.textMuted}>
+      <scrollbox
+        scrollY={true}
+        stickyStart="bottom"
+        height="100%"
+        flexDirection="column"
+        paddingTop={0}
+        paddingBottom={0}
+      >
+        <text fg={theme.textMuted}>
           {props.state()?.question ?? ""}
         </text>
         <Show
@@ -316,18 +341,18 @@ function AnswerScreen(props: {
             <Show
               when={props.state()?.status === "answered"}
               fallback={
-                <text fg={props.api.theme.current.error}>
+                <text fg={theme.error}>
                   {props.state()?.error ?? "The side question failed."}
                 </text>
               }
             >
-              <text fg={props.api.theme.current.markdownText}>
+              <text fg={theme.markdownText}>
                 {props.state()?.text ?? ""}
               </text>
             </Show>
           }
         >
-          <text fg={props.api.theme.current.info}>
+          <text fg={theme.info}>
             {frames[frame()]} thinking
             {props.state()?.text
               ? ` · ${props.state()!.text!.length} chars`
@@ -335,14 +360,15 @@ function AnswerScreen(props: {
           </text>
         </Show>
         <Show when={props.state()?.model}>
-          <text fg={props.api.theme.current.textMuted}>
+          <text fg={theme.textMuted}>
             model: {props.state()?.model}
           </text>
         </Show>
-      </box>
-      <text fg={props.api.theme.current.textMuted}>
+      </scrollbox>
+      <text fg={theme.textMuted}>
         Side answers never enter the session transcript and are not persisted.
       </text>
+      </box>
     </box>
   );
 }
