@@ -1,11 +1,11 @@
-# opencode-btw
+# @proofofwork-agency/opencode-btw
 
 Ephemeral `/btw` side questions for [OpenCode](https://opencode.ai).
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-btw@alpha"]
+  "plugin": ["@proofofwork-agency/opencode-btw@alpha"]
 }
 ```
 
@@ -36,16 +36,16 @@ on it in its next turn. Without `--send` the exchange stays ephemeral.
 Recent side exchanges stay in an in-memory, session-scoped history ring
 (`/btw-history` or `ctrl+b`) that is cleared on exit.
 
-> **Publishing note**: the npm package name `opencode-btw` is taken by an
-> unrelated hint-injection plugin. Publish this package under a scoped or
-> renamed package name before leaving alpha.
+> **Naming**: the package is published as `@proofofwork-agency/opencode-btw`
+> because the unscoped npm name `opencode-btw` is taken by an unrelated
+> hint-injection plugin. The plugin id and `/btw` command are unchanged.
 
 ## Options
 
 ```json
 {
   "plugin": [
-    ["opencode-btw@alpha", { "model": "small", "history": 20, "tool": true }]
+    ["@proofofwork-agency/opencode-btw@alpha", { "model": "small", "history": 20, "tool": true }]
   ]
 }
 ```
@@ -65,6 +65,9 @@ Recent side exchanges stay in an in-memory, session-scoped history ring
 Invalid values fall back to defaults; unknown keys are ignored.
 
 ## Design boundaries
+
+See `docs/comparison.md` for the feature-by-feature scorecard against
+`opencode-bytheway` and the other side-question plugins.
 
 - The side channel has **no tool access**: the `btw` agent disables built-in
   and known plugin tools, denies permissions, and is capped at one step.

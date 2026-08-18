@@ -12,6 +12,6 @@
     "test": "bun run --filter '*' test",
     "typecheck": "bun run --filter '*' typecheck",
     "verify": "bun run typecheck && bun run test && bun run build",
-    "publish:alpha": "bun run verify && npm publish --workspace codex-delegator --tag alpha --access public && npm publish --workspace opencode-codex-delegate --tag alpha --access public && npm publish --workspace opencode-goal --tag alpha --access public && npm publish --workspace opencode-multimodel --tag alpha --access public && npm publish --workspace opencode-btw --tag alpha --access public"
+    "publish:alpha": "bun run verify && npm publish --workspace codex-delegator --tag alpha --access public && npm publish --workspace opencode-codex-delegate --tag alpha --access public && npm publish --workspace opencode-goal --tag alpha --access public && npm publish --workspace opencode-multimodel --tag alpha --access public && npm publish --workspace @proofofwork-agency/opencode-btw --tag alpha --access public"
   }
 }

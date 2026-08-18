@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "opencode-btw",
+  "name": "@proofofwork-agency/opencode-btw",
   "version": "0.2.0-alpha.0",
   "description": "Ephemeral /btw side questions for OpenCode sessions without polluting the main transcript",
   "type": "module",
