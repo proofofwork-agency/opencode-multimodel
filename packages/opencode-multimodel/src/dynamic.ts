@@ -23,19 +23,31 @@ export type ParsedWorkflowCommand = {
 };
 
 export class SessionSelectionCache {
+  private static readonly MAX_SESSIONS = 256;
   private readonly values = new Map<string, SessionSelection>();
 
   remember(sessionID: string, selection: SessionSelection) {
     if (!sessionID) return;
     const current = this.values.get(sessionID) ?? {};
+    this.values.delete(sessionID);
     this.values.set(sessionID, {
       model: selection.model ?? current.model,
       agent: selection.agent ?? current.agent,
     });
+    while (this.values.size > SessionSelectionCache.MAX_SESSIONS) {
+      const oldest = this.values.keys().next().value;
+      if (oldest === undefined) break;
+      this.values.delete(oldest);
+    }
   }
 
   get(sessionID: string) {
-    return this.values.get(sessionID);
+    const value = this.values.get(sessionID);
+    if (value !== undefined) {
+      this.values.delete(sessionID);
+      this.values.set(sessionID, value);
+    }
+    return value;
   }
 }
 
